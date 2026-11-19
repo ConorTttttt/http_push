@@ -1,0 +1,17 @@
+manifest_version: "0"
+name: notes
+integrity:
+  network_seed: ~
+  properties: ~
+  zomes:
+    - name: notes_integrity
+      hash: ~
+      path: "../target/wasm32-unknown-unknown/release/notes_integrity.wasm"
+      dependencies: ~
+coordinator:
+  zomes:
+    - name: notes
+      hash: ~
+      path: "../target/wasm32-unknown-unknown/release/notes.wasm"
+      dependencies:
+        - name: notes_integrity

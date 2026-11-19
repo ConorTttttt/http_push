@@ -1,0 +1,17 @@
+# Minimal test hApp used by scripts/holochain-e2e.sh to prove that a real
+# Holochain application event reaches the HTTP relay. Separate workspace:
+# it is compiled to wasm32-unknown-unknown.
+[workspace]
+resolver = "2"
+members = ["zomes/notes_integrity", "zomes/notes"]
+
+[workspace.dependencies]
+hdi = "=0.8.1"
+hdk = "=0.7.1"
+serde = "1"
+holochain_serialized_bytes = "=0.0.57"
+notes_integrity = { path = "zomes/notes_integrity" }
+
+[profile.release]
+opt-level = "z"
+lto = true

@@ -1,0 +1,15 @@
+manifest_version: "0"
+name: notes
+description: Test hApp for the HTTP push relay end-to-end test
+roles:
+  - name: notes
+    provisioning:
+      strategy: create
+      deferred: false
+    dna:
+      path: "./notes.dna"
+      modifiers:
+        network_seed: ~
+        properties: ~
+      installed_hash: ~
+      clone_limit: 0
