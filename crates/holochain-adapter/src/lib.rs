@@ -31,7 +31,10 @@ pub use optimings::{
 pub use peers::ConductorPeers;
 #[cfg(feature = "ops-integrated-signal")]
 pub use signals::OpsIntegratedSource;
-pub use signals::{integrated_ops_to_changes, signal_digest, signal_to_change, AppSignalSource};
+pub use signals::{
+    basis_loc, integrated_ops_to_changes, signal_digest, signal_to_change, AppSignalSource,
+    IntegratedOpHint,
+};
 
 /// Holochain types used by this crate's public API, for callers and tests.
 pub mod types {

@@ -66,6 +66,13 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     page_size: u32,
 
+    /// This node's storage arc: `full`, `empty` (zero arc) or comma-separated
+    /// `start-end` DHT location ranges. Op hints known to lie outside it are
+    /// skipped (by the relay when it supports `arc_filter`). Hints with an
+    /// unknown location are always delivered.
+    #[arg(long, env = "HC_PUSH_CLIENT_ARC")]
+    arc: Option<hc_push_protocol::ArcFilter>,
+
     /// Append one JSON line of metrics per command (duration, HTTP bytes,
     /// latency) to this file.
     #[arg(long, env = "HC_PUSH_CLIENT_METRICS_OUT")]
@@ -179,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
     let opts = ClientOptions {
         label: cli.label.clone(),
         page_size: cli.page_size,
+        arc: cli.arc.clone(),
         ..ClientOptions::default()
     };
     let mut client = PushClient::new(
@@ -264,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
                     "transfer": report.transfer,
                     "latency": report.latency,
                     "relays": report.outcomes.iter().map(|o| match &o.result {
-                        Ok(s) => serde_json::json!({"relay": o.relay, "ok": true, "pages": s.pages, "received": s.received, "delivered": s.delivered, "duplicates": s.duplicates}),
+                        Ok(s) => serde_json::json!({"relay": o.relay, "ok": true, "pages": s.pages, "received": s.received, "delivered": s.delivered, "duplicates": s.duplicates, "outside_arc": s.outside_arc}),
                         Err(e) => serde_json::json!({"relay": o.relay, "ok": false, "error": e.to_string()}),
                     }).collect::<Vec<_>>(),
                 }),

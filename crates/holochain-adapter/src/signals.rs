@@ -43,23 +43,70 @@ pub fn signal_to_change(sig: &Signal) -> Option<ObservedChange> {
     })
 }
 
-/// Changes for ops reported by an `OpsIntegrated` notification.
-/// `ops` are `(op hash, accepted)`.
+/// One op reported by an `OpsIntegrated` notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegratedOpHint {
+    pub op_hash: String,
+    pub accepted: bool,
+    /// Kitsune2 DHT location of the op (its basis location), if known.
+    pub loc: Option<u32>,
+}
+
+impl From<(String, bool)> for IntegratedOpHint {
+    fn from((op_hash, accepted): (String, bool)) -> Self {
+        Self {
+            op_hash,
+            accepted,
+            loc: None,
+        }
+    }
+}
+
+impl From<(String, bool, Option<u32>)> for IntegratedOpHint {
+    fn from((op_hash, accepted, loc): (String, bool, Option<u32>)) -> Self {
+        Self {
+            op_hash,
+            accepted,
+            loc,
+        }
+    }
+}
+
+/// Kitsune2 DHT location of an op with this basis.
+///
+/// Holochain builds an op's Kitsune2 id from the op hash core and the basis
+/// hash's four location bytes (`DhtOpHash::to_located_k2_op_id`), and
+/// `holochain_p2p` sets Kitsune2's op location callback to read those bytes
+/// as a little-endian `u32`. That is exactly `HoloHash::get_loc` of the
+/// basis, so an op is held by an agent iff its storage arc contains this
+/// value.
+pub fn basis_loc(basis: &holochain_types::prelude::AnyLinkableHash) -> u32 {
+    basis.get_loc()
+}
+
+/// Changes for ops reported by an `OpsIntegrated` notification, one per op.
 pub fn integrated_ops_to_changes(
     space: &str,
     when_integrated_ms: u64,
-    ops: impl IntoIterator<Item = (String, bool)>,
+    ops: impl IntoIterator<Item = impl Into<IntegratedOpHint>>,
 ) -> Vec<ObservedChange> {
     ops.into_iter()
-        .map(|(op_hash, accepted)| ObservedChange {
-            space: space.to_string(),
-            kind: if accepted {
-                ChangeKind::OpIntegrated
-            } else {
-                ChangeKind::OpRejected
-            },
-            refs: vec![ChangeRef::new(RefType::DhtOp, op_hash)],
-            occurred_at_ms: Some(when_integrated_ms),
+        .map(|op| {
+            let op: IntegratedOpHint = op.into();
+            let r = ChangeRef::new(RefType::DhtOp, op.op_hash);
+            ObservedChange {
+                space: space.to_string(),
+                kind: if op.accepted {
+                    ChangeKind::OpIntegrated
+                } else {
+                    ChangeKind::OpRejected
+                },
+                refs: vec![match op.loc {
+                    Some(l) => r.with_loc(l),
+                    None => r,
+                }],
+                occurred_at_ms: Some(when_integrated_ms),
+            }
         })
         .collect()
 }
@@ -81,6 +128,7 @@ pub fn ops_integrated_signal_to_changes(sig: &Signal) -> Vec<ObservedChange> {
                 (
                     o.op_hash.to_string(),
                     o.validity == RecordValidity::Accepted,
+                    Some(basis_loc(&o.basis_hash)),
                 )
             }),
         ),
@@ -264,5 +312,21 @@ mod tests {
         assert_eq!(c[1].kind, ChangeKind::OpRejected);
         assert_eq!(c[0].occurred_at_ms, Some(1234));
         assert_eq!(c[1].refs[0], ChangeRef::new(RefType::DhtOp, "uhCQkB"));
+        let c = integrated_ops_to_changes("uhC0kX", 1, [("uhCQkC".to_string(), true, Some(9))]);
+        assert_eq!(c[0].refs[0].loc, Some(9));
+    }
+
+    #[test]
+    fn basis_location_is_the_kitsune2_op_location() {
+        use holochain_types::prelude::{AnyLinkableHash, EntryHash};
+        // 32 core bytes followed by 4 location bytes, as in a real hash.
+        let mut raw = vec![3u8; 32];
+        raw.extend_from_slice(&[0x78, 0x56, 0x34, 0x12]);
+        let basis = AnyLinkableHash::from(EntryHash::from_raw_36(raw.clone()));
+        // What holochain_p2p's `OpId::set_loc_callback` computes from the
+        // located op id (op core ++ basis loc bytes).
+        let k2 = u32::from_le_bytes(raw[32..36].try_into().unwrap());
+        assert_eq!(k2, 0x1234_5678);
+        assert_eq!(basis_loc(&basis), k2);
     }
 }

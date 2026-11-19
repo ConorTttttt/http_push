@@ -11,7 +11,8 @@
 //! * Subscriptions are stored with a SHA-256 hash of their bearer token only.
 
 use hc_push_protocol::{
-    change_key, ChangeKind, ChangeRef, Cursor, EventEnvelope, PROTOCOL_VERSION,
+    change_key, event_loc, ArcFilter, ChangeKind, ChangeRef, Cursor, EventEnvelope,
+    PROTOCOL_VERSION,
 };
 use hc_push_source_api::ObservedChange;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -19,8 +20,9 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// v2 adds `events.occurred_at_ms` (v1 journals are migrated in place).
-const SCHEMA_VERSION: i64 = 2;
+/// v2 adds `events.occurred_at_ms`, v3 adds `events.loc` (older journals are
+/// migrated in place).
+const SCHEMA_VERSION: i64 = 3;
 
 /// Retention policy.
 #[derive(Debug, Clone, Copy)]
@@ -135,7 +137,8 @@ impl Journal {
                 refs           TEXT NOT NULL,
                 source         TEXT NOT NULL,
                 observed_at_ms INTEGER NOT NULL,
-                occurred_at_ms INTEGER
+                occurred_at_ms INTEGER,
+                loc            INTEGER
             );
             CREATE INDEX IF NOT EXISTS events_space_seq ON events(space, seq);
             CREATE INDEX IF NOT EXISTS events_observed ON events(observed_at_ms);
@@ -169,14 +172,19 @@ impl Journal {
         match get(&conn, "schema_version")? {
             None => put(&conn, "schema_version", &SCHEMA_VERSION.to_string())?,
             Some(v) if v == SCHEMA_VERSION.to_string() => {}
-            Some(v) if v == "1" => {
-                // v1 -> v2: nullable column, existing rows keep NULL.
-                conn.execute_batch(
-                    "BEGIN;
-                     ALTER TABLE events ADD COLUMN occurred_at_ms INTEGER;
-                     UPDATE meta SET value = '2' WHERE key = 'schema_version';
+            Some(v) if v == "1" || v == "2" => {
+                // Nullable columns; existing rows keep NULL (a NULL `loc`
+                // means "location unknown" and passes every arc filter).
+                let mut sql = String::from("BEGIN;");
+                if v == "1" {
+                    sql.push_str("ALTER TABLE events ADD COLUMN occurred_at_ms INTEGER;");
+                }
+                sql.push_str(
+                    "ALTER TABLE events ADD COLUMN loc INTEGER;
+                     UPDATE meta SET value = '3' WHERE key = 'schema_version';
                      COMMIT;",
-                )?;
+                );
+                conn.execute_batch(&sql)?;
             }
             Some(v) => {
                 return Err(JournalError::Db(rusqlite::Error::InvalidParameterName(
@@ -259,8 +267,8 @@ impl Journal {
             // still advances the AUTOINCREMENT counter, leaving gaps.
             let mut exists = tx.prepare_cached("SELECT 1 FROM events WHERE change_key = ?1")?;
             let mut insert = tx.prepare_cached(
-                "INSERT INTO events(change_key, space, kind, refs, source, observed_at_ms, occurred_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO events(change_key, space, kind, refs, source, observed_at_ms, occurred_at_ms, loc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for c in changes {
                 let key = change_key(&c.space, c.kind, &c.refs);
@@ -275,7 +283,8 @@ impl Journal {
                     refs,
                     source_id,
                     now_ms as i64,
-                    c.occurred_at_ms.map(|t| t as i64)
+                    c.occurred_at_ms.map(|t| t as i64),
+                    event_loc(&c.refs).map(i64::from)
                 ])?;
                 if n == 1 {
                     let seq = tx.last_insert_rowid() as u64;
@@ -339,7 +348,16 @@ impl Journal {
     }
 
     /// Read up to `limit` events in `spaces` with `seq > after`.
-    pub fn read_after(&self, after: u64, spaces: &[String], limit: u32) -> JResult<ReadResult> {
+    /// Events after `after` in `spaces`, at most `limit`. With `arc`, events
+    /// whose location is known and outside the arc are skipped (the cursor
+    /// still advances past them, as for other spaces).
+    pub fn read_after(
+        &self,
+        after: u64,
+        spaces: &[String],
+        arc: Option<&ArcFilter>,
+        limit: u32,
+    ) -> JResult<ReadResult> {
         let conn = self.lock();
         let bounds = Self::bounds_locked(&conn)?;
         if after < bounds.pruned_through {
@@ -353,13 +371,30 @@ impl Journal {
             });
         }
         let spaces_json = serde_json::to_string(spaces)?;
+        // `[[start, end], ...]`, or NULL for no filter. An empty array is a
+        // zero arc: only events with an unknown location pass.
+        let arc_json = arc
+            .map(|a| {
+                serde_json::to_string(
+                    &a.ranges()
+                        .iter()
+                        .map(|r| [r.start, r.end])
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .transpose()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, change_key, space, kind, refs, source, observed_at_ms, occurred_at_ms FROM events
              WHERE seq > ?1 AND space IN (SELECT value FROM json_each(?2))
+               AND (?4 IS NULL OR loc IS NULL OR EXISTS (
+                     SELECT 1 FROM json_each(?4) r
+                     WHERE CASE WHEN r.value->>0 <= r.value->>1
+                                THEN loc BETWEEN r.value->>0 AND r.value->>1
+                                ELSE loc >= r.value->>0 OR loc <= r.value->>1 END))
              ORDER BY seq ASC LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            params![after as i64, spaces_json, i64::from(limit) + 1],
+            params![after as i64, spaces_json, i64::from(limit) + 1, arc_json],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -582,14 +617,16 @@ mod tests {
             j.append("m", &[change(s, &i.to_string())], None, 1)
                 .unwrap();
         }
-        let r = j.read_after(0, &spaces(&["even"]), 3).unwrap();
+        let r = j.read_after(0, &spaces(&["even"]), None, 3).unwrap();
         assert_eq!(
             r.events.iter().map(|e| e.seq()).collect::<Vec<_>>(),
             vec![1, 3, 5]
         );
         assert!(r.has_more);
         assert_eq!(r.next_seq, 5);
-        let r = j.read_after(r.next_seq, &spaces(&["even"]), 3).unwrap();
+        let r = j
+            .read_after(r.next_seq, &spaces(&["even"]), None, 3)
+            .unwrap();
         assert_eq!(
             r.events.iter().map(|e| e.seq()).collect::<Vec<_>>(),
             vec![7, 9]
@@ -620,13 +657,13 @@ mod tests {
             }
         );
         assert!(matches!(
-            j.read_after(2, &spaces(&["s"]), 10),
+            j.read_after(2, &spaces(&["s"]), None, 10),
             Err(JournalError::CursorExpired { earliest: 3 })
         ));
-        let r = j.read_after(3, &spaces(&["s"]), 10).unwrap();
+        let r = j.read_after(3, &spaces(&["s"]), None, 10).unwrap();
         assert_eq!(r.events.len(), 3);
         assert!(matches!(
-            j.read_after(7, &spaces(&["s"]), 10),
+            j.read_after(7, &spaces(&["s"]), None, 10),
             Err(JournalError::CursorAhead { .. })
         ));
     }
@@ -715,12 +752,130 @@ mod tests {
         let mut c = change("s", "new");
         c.occurred_at_ms = Some(42);
         j.append("m", &[c], None, 50).unwrap();
-        let r = j.read_after(0, &spaces(&["s"]), 10).unwrap();
+        let r = j.read_after(0, &spaces(&["s"]), None, 10).unwrap();
         assert_eq!(r.events.len(), 2);
         assert_eq!(r.events[0].occurred_at_ms, None);
         assert_eq!(r.events[1].occurred_at_ms, Some(42));
         drop(j);
         // Reopening a migrated journal is a no-op.
+        Journal::open(&path, Retention::default()).unwrap();
+    }
+
+    fn located(space: &str, id: &str, loc: Option<u32>) -> ObservedChange {
+        let r = ChangeRef::new(RefType::DhtOp, id);
+        ObservedChange {
+            space: space.into(),
+            kind: ChangeKind::OpIntegrated,
+            refs: vec![match loc {
+                Some(l) => r.with_loc(l),
+                None => r,
+            }],
+            occurred_at_ms: None,
+        }
+    }
+
+    fn ids(r: &ReadResult) -> Vec<String> {
+        r.events.iter().map(|e| e.refs[0].id.clone()).collect()
+    }
+
+    #[test]
+    fn read_after_filters_by_storage_arc() {
+        let j = Journal::open_in_memory(Retention::default()).unwrap();
+        let q = 1u32 << 30; // a quarter of the location space
+        let changes = [
+            located("s", "q0", Some(5)),
+            located("s", "q1", Some(q + 5)),
+            located("s", "q2", Some(2 * q + 5)),
+            located("s", "q3", Some(3 * q + 5)),
+            located("s", "max", Some(u32::MAX)),
+            located("s", "unknown", None),
+            located("other", "elsewhere", Some(5)),
+        ];
+        j.append("m", &changes, None, 1).unwrap();
+        let s = spaces(&["s"]);
+        let read = |arc: &str| {
+            let arc: ArcFilter = arc.parse().unwrap();
+            j.read_after(0, &s, Some(&arc), 100).unwrap()
+        };
+
+        // No filter and a full arc: everything in the space.
+        let all = j.read_after(0, &s, None, 100).unwrap();
+        assert_eq!(ids(&all), ["q0", "q1", "q2", "q3", "max", "unknown"]);
+        assert_eq!(ids(&read("full")), ids(&all));
+        // Partial arc: first half. Unknown locations are always delivered.
+        assert_eq!(ids(&read("0-2147483647")), ["q0", "q1", "unknown"]);
+        // Wrapping arc: last quarter through the first quarter.
+        let wrap = format!("{}-{}", 3 * q, q - 1);
+        assert_eq!(ids(&read(&wrap)), ["q0", "q3", "max", "unknown"]);
+        // Two ranges.
+        let two = format!("{}-{},{}-{}", q, q + 10, u32::MAX, u32::MAX);
+        assert_eq!(ids(&read(&two)), ["q1", "max", "unknown"]);
+        // Zero arc: only hints whose location is unknown.
+        let zero = read("empty");
+        assert_eq!(ids(&zero), ["unknown"]);
+        // The cursor still reaches the head, past the skipped events.
+        assert_eq!(zero.next_seq, 7);
+        assert!(!zero.has_more);
+    }
+
+    #[test]
+    fn arc_filtered_pages_resume_without_gaps_or_repeats() {
+        let j = Journal::open_in_memory(Retention::default()).unwrap();
+        let changes: Vec<_> = (0..40u32)
+            .map(|i| located("s", &i.to_string(), Some(i.wrapping_mul(0x0F0F_0F0F))))
+            .collect();
+        j.append("m", &changes, None, 1).unwrap();
+        let arc: ArcFilter = "0-1073741823,3221225472-3500000000".parse().unwrap();
+        let expected: Vec<String> = (0..40u32)
+            .filter(|i| arc.contains(i.wrapping_mul(0x0F0F_0F0F)))
+            .map(|i| i.to_string())
+            .collect();
+        assert!(!expected.is_empty() && expected.len() < 40);
+        let mut got = Vec::new();
+        let mut after = 0;
+        loop {
+            let r = j.read_after(after, &spaces(&["s"]), Some(&arc), 3).unwrap();
+            got.extend(ids(&r));
+            after = r.next_seq;
+            if !r.has_more {
+                break;
+            }
+        }
+        assert_eq!(got, expected);
+        assert_eq!(after, 40);
+    }
+
+    #[test]
+    fn migrates_v2_journal_with_unknown_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, change_key TEXT NOT NULL UNIQUE,
+                    space TEXT NOT NULL, kind TEXT NOT NULL, refs TEXT NOT NULL,
+                    source TEXT NOT NULL, observed_at_ms INTEGER NOT NULL,
+                    occurred_at_ms INTEGER);
+                 INSERT INTO meta VALUES ('schema_version','2'),('journal_id','abcd'),
+                    ('relay_id','r'),('pruned_through','0');
+                 INSERT INTO events(change_key, space, kind, refs, source, observed_at_ms, occurred_at_ms)
+                    VALUES ('k1','s','op_integrated','[{\"type\":\"dht_op\",\"id\":\"old\"}]','m',5,4);",
+            )
+            .unwrap();
+        }
+        let j = Journal::open(&path, Retention::default()).unwrap();
+        j.append("m", &[located("s", "new", Some(1 << 31))], None, 50)
+            .unwrap();
+        let zero = ArcFilter::empty();
+        let r = j.read_after(0, &spaces(&["s"]), Some(&zero), 10).unwrap();
+        // The pre-migration event has no location, so even a zero arc gets it.
+        assert_eq!(ids(&r), ["old"]);
+        assert_eq!(r.events[0].occurred_at_ms, Some(4));
+        let r = j.read_after(0, &spaces(&["s"]), None, 10).unwrap();
+        assert_eq!(r.events[1].refs[0].loc, Some(1 << 31));
+        drop(j);
         Journal::open(&path, Retention::default()).unwrap();
     }
 

@@ -16,9 +16,9 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hc_push_protocol::PeersResponse;
 use hc_push_protocol::{
-    ApiError, Capabilities, Cursor, ErrorBody, ErrorCode, EventEnvelope, Health, HealthStatus,
-    LimitsInfo, RegistrationMode, RetentionInfo, SourceHealth, SourceInfo, SourceState,
-    SubscribeRequest, SubscribeResponse, SyncPage, PROTOCOL_VERSION,
+    ApiError, ArcFilter, Capabilities, Cursor, ErrorBody, ErrorCode, EventEnvelope, Health,
+    HealthStatus, LimitsInfo, RegistrationMode, RetentionInfo, SourceHealth, SourceInfo,
+    SourceState, SubscribeRequest, SubscribeResponse, SyncPage, PROTOCOL_VERSION,
 };
 use hc_push_source_api::{now_ms, CancellationToken, DynPeerHints, HealthHandle};
 use serde::Deserialize;
@@ -318,6 +318,7 @@ async fn capabilities(State(state): State<SharedState>) -> Json<Capabilities> {
         },
         transports: vec!["sse".into(), "sync".into()],
         peer_hints: state.peers.is_some(),
+        arc_filter: true,
         registration: s.registration_mode,
     })
 }
@@ -431,6 +432,15 @@ async fn unsubscribe(
 pub struct SyncQuery {
     pub cursor: Option<String>,
     pub limit: Option<u32>,
+    /// Storage arc filter; see [`hc_push_protocol::ArcFilter`].
+    pub arc: Option<String>,
+}
+
+/// Parse the optional `arc` query parameter.
+pub fn parse_arc(raw: Option<&str>) -> Result<Option<ArcFilter>, ApiErr> {
+    raw.map(|a| a.parse::<ArcFilter>())
+        .transpose()
+        .map_err(|e| ApiErr::bad_request(e.to_string()))
 }
 
 /// Parse and check a client cursor against this journal. `None` means "from
@@ -470,13 +480,14 @@ async fn sync(
         )));
     }
     let after = resolve_cursor(&state, q.cursor.as_deref())?;
+    let arc = parse_arc(q.arc.as_deref())?;
     let spaces = sub.spaces.clone();
     let res = blocking(&state, move |j| {
         let after = match after {
             Some(a) => a,
             None => j.bounds()?.pruned_through,
         };
-        j.read_after(after, &spaces, limit)
+        j.read_after(after, &spaces, arc.as_ref(), limit)
     })
     .await?;
     state.metrics.record_sync_page(res.events.len());

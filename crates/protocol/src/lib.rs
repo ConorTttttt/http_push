@@ -228,6 +228,15 @@ pub struct ChangeRef {
     #[serde(rename = "type")]
     pub ref_type: RefType,
     pub id: String,
+    /// Kitsune2 DHT location of the referenced op, if the source knows it.
+    ///
+    /// For a Holochain `DhtOpHash` this is the location of the op's *basis*
+    /// hash (`AnyLinkableHash::get_loc()`), which is the location Kitsune2
+    /// uses to decide which agents' storage arcs hold the op. Like the rest
+    /// of the hint it is unverified: a client must not trust it beyond
+    /// deciding which hints to look at. Not part of [`change_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loc: Option<u32>,
 }
 
 impl ChangeRef {
@@ -235,7 +244,158 @@ impl ChangeRef {
         Self {
             ref_type,
             id: id.into(),
+            loc: None,
         }
+    }
+
+    /// Attach the DHT location of the referenced op.
+    pub fn with_loc(mut self, loc: u32) -> Self {
+        self.loc = Some(loc);
+        self
+    }
+}
+
+/// The DHT location of an event: `Some` only when every ref carries the same
+/// location (true for op hints, which have exactly one ref). `None` means the
+/// location is unknown.
+pub fn event_loc(refs: &[ChangeRef]) -> Option<u32> {
+    let first = refs.first()?.loc?;
+    refs.iter().all(|r| r.loc == Some(first)).then_some(first)
+}
+
+// ---------------------------------------------------------------------------
+// Storage arcs
+// ---------------------------------------------------------------------------
+
+/// Maximum number of ranges in an [`ArcFilter`].
+pub const MAX_ARC_RANGES: usize = 8;
+
+/// An inclusive range of Kitsune2 DHT locations. When `start > end` the
+/// range wraps past `u32::MAX`, as `kitsune2_api::DhtArc::Arc` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DhtArcRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl DhtArcRange {
+    /// Every location.
+    pub const FULL: DhtArcRange = DhtArcRange {
+        start: 0,
+        end: u32::MAX,
+    };
+
+    pub fn contains(&self, loc: u32) -> bool {
+        if self.start <= self.end {
+            self.start <= loc && loc <= self.end
+        } else {
+            loc >= self.start || loc <= self.end
+        }
+    }
+}
+
+/// The storage arc(s) a client holds, used to select which op hints it
+/// receives (`arc` query parameter of `/v1/sync` and `/v1/events`).
+///
+/// No ranges means a zero arc. Text form: `empty`, `full`, or up to
+/// [`MAX_ARC_RANGES`] comma-separated `start-end` pairs of decimal `u32`
+/// (inclusive, wrapping when `start > end`), e.g. `0-1073741823`.
+///
+/// Filtering is conservative: an event whose location is unknown (see
+/// [`event_loc`]) is always admitted, because the relay cannot tell whether
+/// it belongs to the arc. Clients must not treat such hints as data they
+/// are required to hold.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ArcFilter {
+    ranges: Vec<DhtArcRange>,
+}
+
+impl ArcFilter {
+    /// A zero arc: no located hints are admitted.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// A full arc: every hint is admitted.
+    pub fn full() -> Self {
+        Self {
+            ranges: vec![DhtArcRange::FULL],
+        }
+    }
+
+    pub fn from_ranges(ranges: Vec<DhtArcRange>) -> Result<Self, ArcParseError> {
+        if ranges.len() > MAX_ARC_RANGES {
+            return Err(ArcParseError);
+        }
+        Ok(Self { ranges })
+    }
+
+    pub fn ranges(&self) -> &[DhtArcRange] {
+        &self.ranges
+    }
+
+    /// True for a zero arc.
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    pub fn contains(&self, loc: u32) -> bool {
+        self.ranges.iter().any(|r| r.contains(loc))
+    }
+
+    /// Whether an event with these refs is admitted: its location is unknown,
+    /// or it lies inside the arc.
+    pub fn admits(&self, refs: &[ChangeRef]) -> bool {
+        match event_loc(refs) {
+            None => true,
+            Some(loc) => self.contains(loc),
+        }
+    }
+}
+
+impl fmt::Display for ArcFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.ranges.is_empty() {
+            return f.write_str("empty");
+        }
+        for (i, r) in self.ranges.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{}-{}", r.start, r.end)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("malformed arc: expected `empty`, `full` or up to 8 comma-separated `start-end` u32 pairs")]
+pub struct ArcParseError;
+
+impl FromStr for ArcFilter {
+    type Err = ArcParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "empty" => return Ok(Self::empty()),
+            "full" => return Ok(Self::full()),
+            _ => {}
+        }
+        let mut ranges = Vec::new();
+        for part in s.split(',') {
+            let (a, b) = part.split_once('-').ok_or(ArcParseError)?;
+            let parse = |x: &str| {
+                if x.is_empty() || !x.bytes().all(|c| c.is_ascii_digit()) {
+                    return Err(ArcParseError);
+                }
+                x.parse::<u32>().map_err(|_| ArcParseError)
+            };
+            ranges.push(DhtArcRange {
+                start: parse(a)?,
+                end: parse(b)?,
+            });
+        }
+        Self::from_ranges(ranges)
     }
 }
 
@@ -498,6 +658,10 @@ pub struct Capabilities {
     /// own conductor).
     #[serde(default)]
     pub peer_hints: bool,
+    /// `/v1/sync` and `/v1/events` accept an `arc` parameter (see
+    /// [`ArcFilter`]).
+    #[serde(default)]
+    pub arc_filter: bool,
     pub registration: RegistrationMode,
 }
 
@@ -612,6 +776,100 @@ mod tests {
         assert!(!is_valid_ref_id("a/b"));
         assert!(is_valid_label("Pixel 9 (work)"));
         assert!(!is_valid_label("bad\nlabel"));
+    }
+
+    #[test]
+    fn arc_ranges_match_kitsune2_semantics() {
+        let plain = DhtArcRange { start: 10, end: 20 };
+        assert!(plain.contains(10) && plain.contains(20) && plain.contains(15));
+        assert!(!plain.contains(9) && !plain.contains(21));
+        // Wraps past u32::MAX.
+        let wrap = DhtArcRange {
+            start: u32::MAX - 5,
+            end: 5,
+        };
+        for loc in [u32::MAX - 5, u32::MAX, 0, 5] {
+            assert!(wrap.contains(loc), "{loc}");
+        }
+        for loc in [6, u32::MAX - 6, 1 << 31] {
+            assert!(!wrap.contains(loc), "{loc}");
+        }
+        let single = DhtArcRange { start: 7, end: 7 };
+        assert!(single.contains(7) && !single.contains(8));
+        assert!(DhtArcRange::FULL.contains(0) && DhtArcRange::FULL.contains(u32::MAX));
+    }
+
+    #[test]
+    fn arc_filter_parses_and_admits_conservatively() {
+        let half: ArcFilter = "0-2147483647".parse().unwrap();
+        assert_eq!(half.to_string(), "0-2147483647");
+        let op = |loc: Option<u32>| {
+            let r = ChangeRef::new(RefType::DhtOp, "uhCQkAAA");
+            vec![match loc {
+                Some(l) => r.with_loc(l),
+                None => r,
+            }]
+        };
+        assert!(half.admits(&op(Some(5))));
+        assert!(!half.admits(&op(Some(1 << 31))));
+        // Unknown location: always admitted.
+        assert!(half.admits(&op(None)));
+        let zero: ArcFilter = "empty".parse().unwrap();
+        assert!(zero.is_empty());
+        assert!(!zero.admits(&op(Some(0))));
+        assert!(zero.admits(&op(None)));
+        assert!(zero.admits(&[ChangeRef::new(RefType::Digest, "sha256:00")]));
+        let full: ArcFilter = "full".parse().unwrap();
+        assert!(full.admits(&op(Some(u32::MAX))));
+        assert_eq!(full.to_string(), "0-4294967295");
+        let two: ArcFilter = "4294967290-5,100-200".parse().unwrap();
+        assert_eq!(two.ranges().len(), 2);
+        assert!(two.contains(150) && two.contains(3) && !two.contains(50));
+        assert_eq!(two.to_string().parse::<ArcFilter>().unwrap(), two);
+        for bad in [
+            "",
+            "-",
+            "1-",
+            "-1",
+            "a-b",
+            "1-2,",
+            "1-4294967296",
+            "+1-2",
+            "1..2",
+            " 1-2",
+            "0-1,0-1,0-1,0-1,0-1,0-1,0-1,0-1,0-1",
+        ] {
+            assert!(bad.parse::<ArcFilter>().is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn event_location_requires_agreeing_refs() {
+        let a = ChangeRef::new(RefType::DhtOp, "a").with_loc(1);
+        let b = ChangeRef::new(RefType::DhtOp, "b").with_loc(2);
+        let n = ChangeRef::new(RefType::DhtOp, "c");
+        assert_eq!(event_loc(std::slice::from_ref(&a)), Some(1));
+        assert_eq!(event_loc(&[a.clone(), a.clone()]), Some(1));
+        assert_eq!(event_loc(&[a.clone(), b]), None);
+        assert_eq!(event_loc(&[a, n]), None);
+        assert_eq!(event_loc(&[]), None);
+    }
+
+    #[test]
+    fn location_is_optional_on_the_wire_and_not_part_of_the_key() {
+        let plain = ChangeRef::new(RefType::DhtOp, "uhCQkAAA");
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"type":"dht_op","id":"uhCQkAAA"}"#
+        );
+        let located = plain.clone().with_loc(42);
+        let json = serde_json::to_string(&located).unwrap();
+        assert_eq!(json, r#"{"type":"dht_op","id":"uhCQkAAA","loc":42}"#);
+        assert_eq!(serde_json::from_str::<ChangeRef>(&json).unwrap(), located);
+        assert_eq!(
+            change_key("s", ChangeKind::OpIntegrated, &[plain]),
+            change_key("s", ChangeKind::OpIntegrated, &[located])
+        );
     }
 
     #[test]

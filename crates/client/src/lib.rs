@@ -18,8 +18,9 @@ pub mod sse;
 pub mod state;
 
 use hc_push_protocol::{
-    ApiError, Cursor, ErrorBody, ErrorCode, EventEnvelope, PeersResponse, SubscribeRequest,
-    SubscribeResponse, SyncPage, SyncRequired, SSE_EVENT_CHANGE, SSE_EVENT_SYNC_REQUIRED,
+    ApiError, ArcFilter, Cursor, ErrorBody, ErrorCode, EventEnvelope, PeersResponse,
+    SubscribeRequest, SubscribeResponse, SyncPage, SyncRequired, SSE_EVENT_CHANGE,
+    SSE_EVENT_SYNC_REQUIRED,
 };
 use reqwest::StatusCode;
 pub use state::{ClientState, FileStateStore, MemoryStateStore, RelayState, StateStore};
@@ -50,6 +51,11 @@ pub struct ClientOptions {
     pub retry_base: Duration,
     pub seen_capacity: usize,
     pub label: Option<String>,
+    /// This node's storage arc. When set, op hints whose location is known
+    /// and outside the arc are not delivered to the handler. Relays that
+    /// advertise `arc_filter` skip them server-side; for others the client
+    /// filters them after download.
+    pub arc: Option<ArcFilter>,
 }
 
 impl Default for ClientOptions {
@@ -63,6 +69,7 @@ impl Default for ClientOptions {
             retry_base: Duration::from_millis(200),
             seen_capacity: 10_000,
             label: None,
+            arc: None,
         }
     }
 }
@@ -115,6 +122,9 @@ pub struct RelaySyncStats {
     pub received: usize,
     pub delivered: usize,
     pub duplicates: usize,
+    /// Hints received but not delivered because their location is outside
+    /// [`ClientOptions::arc`] (only from relays that do not filter).
+    pub outside_arc: usize,
     pub cursor: Option<Cursor>,
     /// Stopped because of `max_pages_per_sync`; call sync again.
     pub more_pending: bool,
@@ -279,6 +289,8 @@ pub struct PushClient {
     counters: Arc<TransferCounters>,
     lat_relay: Vec<u64>,
     lat_origin: Vec<u64>,
+    /// Relay URL -> whether it filters by `arc` itself (from capabilities).
+    arc_support: std::sync::Mutex<std::collections::HashMap<String, bool>>,
 }
 
 fn now_ms() -> u64 {
@@ -366,7 +378,42 @@ impl PushClient {
             counters: Arc::default(),
             lat_relay: Vec::new(),
             lat_origin: Vec::new(),
+            arc_support: Default::default(),
         })
+    }
+
+    /// The `arc` query parameter to send to the relay at `url`, if any:
+    /// only when an arc is configured and the relay advertises `arc_filter`
+    /// (older relays reject unknown parameters).
+    async fn arc_param(&self, url: &str) -> Option<String> {
+        let arc = self.opts.arc.as_ref()?;
+        let cached = self
+            .arc_support
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(url)
+            .copied();
+        let supported = match cached {
+            Some(s) => s,
+            None => {
+                let req = self
+                    .http
+                    .get(Self::url(url, "/v1/capabilities"))
+                    .timeout(self.opts.request_timeout);
+                let resp = self.execute(req).await.ok()?;
+                if resp.status() != StatusCode::OK {
+                    return None;
+                }
+                let caps: serde_json::Value = self.json_body(resp).await.ok()?;
+                let s = caps["arc_filter"].as_bool().unwrap_or(false);
+                self.arc_support
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(url.to_string(), s);
+                s
+            }
+        };
+        supported.then(|| arc.to_string())
     }
 
     /// Total HTTP traffic of this client instance.
@@ -543,6 +590,9 @@ impl PushClient {
         if let Some(c) = &rs.cursor {
             req = req.query(&[("cursor", c.to_string())]);
         }
+        if let Some(arc) = self.arc_param(&rs.url).await {
+            req = req.query(&[("arc", arc)]);
+        }
         let resp = self.execute(req).await?;
         if resp.status() != StatusCode::OK {
             return Err(error_from_response(resp, &self.counters).await);
@@ -606,7 +656,9 @@ impl PushClient {
         stats: &mut RelaySyncStats,
     ) -> Result<(), RelayError> {
         stats.received += 1;
-        if self.state.seen.contains(&e.change_key) {
+        if self.opts.arc.as_ref().is_some_and(|a| !a.admits(&e.refs)) {
+            stats.outside_arc += 1;
+        } else if self.state.seen.contains(&e.change_key) {
             stats.duplicates += 1;
         } else {
             handler(e).map_err(|err| RelayError::Handler(err.to_string()))?;
@@ -765,6 +817,9 @@ impl PushClient {
             .header(reqwest::header::ACCEPT, "text/event-stream");
         if let Some(c) = &rs.cursor {
             req = req.header("last-event-id", c.to_string());
+        }
+        if let Some(arc) = self.arc_param(&rs.url).await {
+            req = req.query(&[("arc", arc)]);
         }
         let resp = tokio::time::timeout(self.opts.request_timeout, self.execute(req))
             .await

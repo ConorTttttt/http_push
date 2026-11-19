@@ -7,7 +7,7 @@
 //! broadcast, the relay sends `sync_required` and closes the stream; the
 //! client then pages through `/v1/sync` and reconnects.
 
-use crate::api::{blocking, resolve_cursor, ApiErr, AuthedSub, SharedState};
+use crate::api::{blocking, parse_arc, resolve_cursor, ApiErr, AuthedSub, SharedState};
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -27,6 +27,8 @@ use tokio::sync::broadcast::error::RecvError;
 #[serde(deny_unknown_fields)]
 pub struct EventsQuery {
     pub cursor: Option<String>,
+    /// Storage arc filter; see [`hc_push_protocol::ArcFilter`].
+    pub arc: Option<String>,
 }
 
 /// Releases the per-subscription SSE slot when the stream is dropped.
@@ -81,6 +83,7 @@ pub async fn events(
         .map(str::to_string)
         .or(q.cursor);
     let start = resolve_cursor(&state, raw.as_deref())?;
+    let arc = parse_arc(q.arc.as_deref())?;
 
     // Bounded resources: a global slot and a per-subscription count.
     let permit = state
@@ -110,8 +113,13 @@ pub async fn events(
     let replay_limit = state.settings.sse_replay_limit;
     let replay = match start {
         Some(after) => {
-            let spaces = spaces.clone();
-            Some(blocking(&state, move |j| j.read_after(after, &spaces, replay_limit)).await?)
+            let (spaces, arc) = (spaces.clone(), arc.clone());
+            Some(
+                blocking(&state, move |j| {
+                    j.read_after(after, &spaces, arc.as_ref(), replay_limit)
+                })
+                .await?,
+            )
         }
         None => None,
     };
@@ -149,7 +157,9 @@ pub async fn events(
                                 continue;
                             }
                             last_seq = env.seq();
-                            if spaces.contains(&env.space) {
+                            if spaces.contains(&env.space)
+                                && arc.as_ref().is_none_or(|a| a.admits(&env.refs))
+                            {
                                 st.metrics.record_sse_sent(env.observed_at_ms, now_ms());
                                 yield Ok(change_event(env));
                             }
