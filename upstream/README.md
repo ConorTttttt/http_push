@@ -12,9 +12,9 @@ tests and status are documented in
 | `kitsune2-main/` | `holochain/kitsune2` `main` (`1d26e00`, 0.6.0-dev.3) | 0001 as above |
 | `holochain-main/` | `holochain/holochain` `main` (`90198dd`, 0.8.0-dev.15) | 0001, 0002 as above (`RequestGossipRound.url` is a `String` on main, like `PeerMetaInfo`) |
 
-Each series applies with `git am` on its base. The `main` ports apply and
-were adapted where `main` differs, but have not yet been built or tested
-(see `docs/upstream-changes.md` for what has). The Holochain 0001 patch
+Each series applies with `git am` on its base. All four were built and
+their new and neighbouring unit tests run; see `docs/results.md`
+("Upstream test runs"). The Holochain 0001 patch
 does not depend on anything else and can be reviewed and taken alone.
 
 To build Holochain 0002 against the patched Kitsune2 without publishing it,

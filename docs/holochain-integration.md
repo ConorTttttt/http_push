@@ -12,6 +12,7 @@ against the source at the revisions below; nothing is inferred from memory.
 | holochain/holochain `main` | `90198dd` (2026-11-18) | 0.8.0-dev.15 / conductor API 0.8.0-dev.13 / kitsune2 0.6.0-dev.3 |
 | holochain/holochain `main-0.7` | `c5f5028` (2026-10-14) | **Stable line used**: holochain 0.7.1, `holochain_client` 0.9.1, `holochain_conductor_api` 0.7.1, kitsune2 0.5.x |
 | holochain/kitsune2 `main` | `1d26e00` (2026-11-09) | 0.6.0-dev.3; stable 0.5.3 on crates.io |
+| holochain/kitsune2 tag `v0.5.1` | `2f178b0` | the version `holochain-0.7.1`'s `Cargo.lock` pins; base of `upstream/kitsune2-0.5.1` |
 | holochain/hc-http-gw `main` | `8556a11` (2026-11-10) | 0.4.0, targets Holochain 0.7 (`holochain_client` 0.9) |
 | Holo-Host/edgenode `main` | `ed76b36` (2026-10-06) | Holochain 0.7.0 under s6-overlay |
 | Holo-Host/h2hc-linker `main` | `cab242d` (2026-08-28) | alpha gateway for zero-arc browser clients |

@@ -20,6 +20,13 @@ upstream/
   holochain-main/     the same series ported to holochain main (90198dd, 0.8.0-dev.15)
 ```
 
+On `main` the series applied without conflicts except one hunk of
+`RequestGossipRound`'s request handler; there `AppRequest` URLs are
+strings (for the TypeScript bindings), so the main port takes
+`url: String` and parses it, like `PeerMetaInfo`. Both `main` series were
+built (Holochain `main` against the patched Kitsune2 `main`) and their
+tests pass; exact runs are in `docs/results.md`.
+
 Apply with `git am` on the named base (`v0.5.1` / `holochain-0.7.1`), or run
 `scripts/build-patched-holochain.sh`, which applies the 0.7.1 series and
 builds the patched conductor (against the patched Kitsune2) plus the relay,
@@ -28,8 +35,8 @@ U2 and can be taken alone (`holochain-0.7.1/0001`).
 
 | # | Change | Component | What it unlocks | State |
 |---|---|---|---|---|
-| U1 | Opt-in `SystemSignal::OpsIntegrated`, delivered in order | holochain | Event-driven relay notifications instead of polling | **Patch + tests** on 0.7.1; ported to main (build and tests pending) |
-| U2 | Request the next gossip round with a given, verified peer | kitsune2 + holochain app API | Fast catch-up from a known always-on peer despite stale peers | **Patches + tests** on 0.7.1; ported to main (build and tests pending) |
+| U1 | Opt-in `SystemSignal::OpsIntegrated`, delivered in order | holochain | Event-driven relay notifications instead of polling | **Patch + tests**, 0.7.1 and main |
+| U2 | Request the next gossip round with a given, verified peer | kitsune2 + holochain app API | Fast catch-up from a known always-on peer despite stale peers | **Patches + tests**, 0.7.1 and main |
 | U3 | Stale-peer handling and peer health | kitsune2 / holochain | Catch-up and `get` not delayed by unreachable peers | Measured; proposals |
 | U4 | `holochain_client`: don't panic on unknown signal variants | holochain_client (Rust) | Forward-compatible signals | Proposal |
 | U5 | `OpTimingDump`: basis hash / op type / action hash | holochain conductor API | Actionable, arc-filterable hints from the polling path | Proposal |
@@ -254,11 +261,21 @@ AppWebsocket::request_gossip_round(dna_hash, url)
 
 ### Effect (lifecycle benchmark)
 
-See `docs/results.md`: with bootstrap enabled, a stale peer A and two
-independent always-on peers, the phone validated all 104+ required ops
-about 6 s after its conductor started with the request, against tens of
-seconds without it. The improvement comes entirely from choosing the peer
-the relay named. No gossip goes through the relay.
+`docs/results.md`, with bootstrap enabled, a stale peer A in the bootstrap
+service and two independent always-on peers B and D (each with its own
+relay):
+
+| Phone conductor | All ~102 hinted ops validated by the phone, ms after start |
+|---|---|
+| stock 0.7.1 (8 runs) | 6033, 6150, 6187, 48049, 48165, 48271, 70321, 70526 |
+| patched, no request (2 runs) | 47129, 47162 |
+| patched + `RequestGossipRound` for B and D (8 runs) | 6165–6409 |
+
+The improvement comes entirely from choosing the peers the relays named:
+the phone never initiated gossip with A, and no gossip goes through a
+relay. The remaining ~6 s is conductor start-up (~2 s) and waiting for the
+iroh home relay (~3 s, U3 item 5); the transfer and validation of ~102 ops
+took about 1 s.
 
 ### Not done
 

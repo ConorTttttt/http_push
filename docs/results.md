@@ -149,6 +149,80 @@ Every run validated every required op. Per run, "all required ops validated":
 * Kitsune2 byte counts cover connections still open at measurement time.
 <!-- lifecycle-tables:end -->
 
+## Tests
+
+### This repository
+
+`cargo test --workspace`: **80 tests pass** (63 before this milestone).
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all -- --check` are clean. New in this milestone:
+
+* `crates/protocol`: arc semantics identical to `kitsune2_api::DhtArc`
+  (inclusive, wrapping), parsing, conservative `admits`, `loc` optional on
+  the wire and not part of `change_key`.
+* `crates/relay/src/journal.rs`: filtering by partial, wrapping,
+  multi-range and zero arcs in SQL; arc-filtered pages resume without gaps
+  or repeats; v2 → v3 journal migration (old events have no location and
+  pass every filter).
+* `crates/relay/tests/arc_filter.rs`: `/v1/sync` and `/v1/events` (replay
+  and live) with `arc=`, `400` on malformed arcs; the client sends `arc`
+  to a relay that advertises `arc_filter`, and against a pre-arc relay that
+  rejects unknown parameters it never sends it and filters itself.
+* `crates/holochain-adapter`: `OpsIntegrated` hints carry
+  `basis_hash.get_loc()`, checked against the byte layout Kitsune2's op
+  location callback reads.
+* `crates/device`: required-op selection for full, partial, wrapping and
+  zero arcs, deduplication across relays, completion only for ops this
+  conductor validated itself.
+* `crates/relay/tests/holochain_reconcile.rs` (milestone 2) still covers
+  missed events and relay restarts against a scripted conductor; the
+  `round-relay-restart` lifecycle variant now covers them against real
+  patched conductors.
+
+### Upstream test runs
+
+Run in the patched trees (`upstream/`), with the test-only IPv6 shim where
+a conductor is started. The full Holochain and Kitsune2 suites were **not**
+run.
+
+Kitsune2 `v0.5.1` + `kitsune2-0.5.1/0001` and Holochain `0.7.1` +
+`holochain-0.7.1/0001-0002` (built against the patched Kitsune2). Measured
+before the final rustfmt-only amendment of the series; reruns on the final
+series are in progress:
+
+```
+kitsune2: cargo test -p kitsune2_gossip -p kitsune2_api -p kitsune2_core --lib
+  kitsune2_gossip 71 passed (67 existing + 4 new), kitsune2_api 34, kitsune2_core 108
+holochain: cargo test -p holochain_state --lib -- dht_store::tests::integrate_ready_ops
+  4 passed
+holochain: cargo test -p holochain --lib -- conductor::conductor::app_broadcast
+  8 passed
+holochain: cargo test -p holochain --lib -- conductor::conductor::tests::request_gossip_round
+  1 passed; repeated 6 times: Bob synced 0.2-1.1 s after the request
+```
+
+Kitsune2 `main` (`1d26e00`) + `kitsune2-main/0001`:
+
+```
+cargo test -p kitsune2_gossip -p kitsune2_api --lib
+  kitsune2_api     41 passed
+  kitsune2_gossip  71 passed  (incl. the 4 request-round tests)
+```
+
+Holochain `main` (`90198dd`) + `holochain-main/0001-0002`, built against the
+patched Kitsune2 `main` (`cargo build -p holochain --bin holochain`: no
+warnings):
+
+```
+cargo test -p holochain_state --lib -- dht_store::tests::integrate_ready_ops
+  4 passed   (incl. integrate_ready_ops_notifies_observer_through_clones)
+cargo test -p holochain --lib -- conductor::conductor::app_broadcast \
+    conductor::conductor::tests::request_gossip_round core::workflow::integrate_dht_ops_workflow
+  13 passed  (8 app_broadcast incl. ordering / 1001-op split / non-blocking
+             overflow, 4 existing integration-workflow tests, and
+             requested_gossip_round_syncs_before_the_schedule)
+```
+
 ## Milestone 2: three conductors, polling vs event-driven
 
 Each row is one run of `scripts/holochain-three-node-e2e.sh`. The raw
