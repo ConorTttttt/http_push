@@ -31,7 +31,11 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug)]
-#[command(name = "hc-push-device", version, about = "Device-side catch-up helper")]
+#[command(
+    name = "hc-push-device",
+    version,
+    about = "Device-side catch-up helper"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -209,7 +213,10 @@ async fn catch_up(a: CatchUp) -> anyhow::Result<serde_json::Value> {
         if agents(&app, &dna).await.iter().any(|s| s.agent == own) {
             break now_ms();
         }
-        anyhow::ensure!(tokio::time::Instant::now() < deadline, "own agent never joined");
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "own agent never joined"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
@@ -272,7 +279,10 @@ async fn catch_up(a: CatchUp) -> anyhow::Result<serde_json::Value> {
         .await
         .map(|s| k2_bytes(&s.transport_stats))
         .map_err(|e| anyhow::anyhow!("dump_network_stats: {e:?}"))?;
-    let own_info = agents(&app, &dna).await.into_iter().find(|s| s.agent == own);
+    let own_info = agents(&app, &dna)
+        .await
+        .into_iter()
+        .find(|s| s.agent == own);
     let ms = |t: Option<u64>| t.map(rel);
     Ok(serde_json::json!({
         "synced": t_synced.is_some(),
@@ -307,8 +317,7 @@ async fn catch_up(a: CatchUp) -> anyhow::Result<serde_json::Value> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .with_writer(std::io::stderr)
         .init();

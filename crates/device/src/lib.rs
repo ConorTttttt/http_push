@@ -191,8 +191,16 @@ mod tests {
             op(2, "high", Some(u32::MAX - 10)),
             op(3, "unknown", None),
             op(4, "low", Some(10)), // the same op hinted by a second relay
-            hint(5, ChangeKind::AppSignal, ChangeRef::new(RefType::Digest, "sha256:00")),
-            hint(6, ChangeKind::OpRejected, ChangeRef::new(RefType::DhtOp, "bad")),
+            hint(
+                5,
+                ChangeKind::AppSignal,
+                ChangeRef::new(RefType::Digest, "sha256:00"),
+            ),
+            hint(
+                6,
+                ChangeKind::OpRejected,
+                ChangeRef::new(RefType::DhtOp, "bad"),
+            ),
         ]
     }
 
@@ -203,7 +211,10 @@ mod tests {
             s.required.iter().map(String::as_str).collect::<Vec<_>>(),
             ["high", "low", "unknown"]
         );
-        assert_eq!((s.outside_arc, s.unlocated_not_required, s.other), (0, 0, 2));
+        assert_eq!(
+            (s.outside_arc, s.unlocated_not_required, s.other),
+            (0, 0, 2)
+        );
     }
 
     #[test]
@@ -250,7 +261,8 @@ mod tests {
             "agent": "AAAA", "space": "BBBB", "createdAt": "1", "expiresAt": "2",
             "isTombstone": false, "url": "http://127.0.0.1:1/x", "storageArc": [0, 4294967295u32]
         });
-        let enc = serde_json::json!({ "agentInfo": inner.to_string(), "signature": "c2ln" }).to_string();
+        let enc =
+            serde_json::json!({ "agentInfo": inner.to_string(), "signature": "c2ln" }).to_string();
         let a = parse_agent_info(&enc).unwrap();
         assert_eq!(a.url.as_deref(), Some("http://127.0.0.1:1/x"));
         assert_eq!(a.storage_arc, Some((0, u32::MAX)));
