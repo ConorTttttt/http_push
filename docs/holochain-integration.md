@@ -179,8 +179,9 @@ What a relay can and cannot do:
 | G4 | No app-API way to fetch raw op data by op hash for forwarding into another conductor's `process_incoming_ops` | Real op-level sync to phones must go through Kitsune2 itself | Either an app-API `FetchOps(op_ids)` returning `DhtOp`s plus an "ingest ops" API on the receiving conductor that runs normal validation, or (preferred) the Kitsune2 transport route in `architecture.md` |
 | G5 | Kitsune2 module factories cannot be supplied from outside the conductor | A `ReportFactory` that would observe every fetched op cannot be added without patching Holochain | Conductor config hook for extra K2 report/observer modules |
 | G6 | Holochain's websocket `dual_bind` aborts when the kernel has no IPv6 (`EAFNOSUPPORT`); it only falls back on `EADDRNOTAVAIL` | The conductor cannot start on IPv6-less hosts. The e2e scripts work around this with a test-only `LD_PRELOAD` errno shim (`scripts/support/no-ipv6-shim.c`) | Treat `ErrorKind::Unsupported`/`EAFNOSUPPORT` like `AddrNotAvailable` in `holochain_websocket::dual_bind` (unchanged on `main` as of `90198dd`) |
-| G7 | No API to start a gossip round with a chosen peer | A restarted lightweight node cannot say "sync with this HoloPort now" | U2 in `upstream-changes.md` |
-| G8 | Gossip target selection keeps choosing an offline peer whose record has not expired | Catch-up after restart took 47–84 s with bootstrap (each attempt waits out a transport connect timeout) vs about 6 s with only the relay-supplied peer | U3 in `upstream-changes.md` |
+| G7 | No API to start a gossip round with a chosen peer | A restarted lightweight node cannot say "sync with this HoloPort now" | **U2, implemented as patches** (Kitsune2 `Gossip::request_round` + Holochain `AppRequest::RequestGossipRound`) |
+| G8 | Gossip target selection keeps choosing an offline peer whose record has not expired | Catch-up after restart took 47–84 s with bootstrap (each attempt waits out a transport connect timeout) vs about 6 s with only the relay-supplied peer. A zero-arc node's first `get` can fail the same way | U2 avoids it for catch-up; U3 (connect timeout, health-aware selection) in `upstream-changes.md` |
+| G10 | Partial storage arcs cannot be configured (0.7.1: `target_arc_factor` 0 or 1; Kitsune2 without `sharding` only grows to full), and the current arc restarts empty | Arc-aware hints are exercised end to end only for zero and full arcs | U8 in `upstream-changes.md` |
 | G9 | `holochain_client` 0.9.1 panics on any signal variant it cannot decode | New system signals must be opt-in per connection | U4 in `upstream-changes.md` |
 
 The proposed fixes, and the one implemented patch, are collected in
@@ -208,6 +209,20 @@ Other observations from the live runs:
   `integrate_dht_ops_consumer`. The workflow retried and every op
   integrated.
 
+* **Where an op lives.** Holochain gives each op a Kitsune2 id made of the
+  op hash core plus the *basis* hash's four location bytes
+  (`DhtOpHash::to_located_k2_op_id`). `holochain_p2p` sets Kitsune2's op
+  location callback to read those bytes as a little-endian `u32`. So an
+  op's DHT location is `basis_hash.get_loc()`, and an agent stores it iff
+  its storage arc (inclusive, wrapping `DhtArc::Arc(start, end)`) contains
+  that value. `OpsIntegrated` carries the basis hash, so the event-driven
+  relay labels every op hint with its location (`refs[].loc`).
+  `DumpOpTimings` does not (G2), so polled hints have no location.
+* **Connect timeout.** Holochain sets iroh's connect timeout to 3/8 of
+  `network.request_timeout_s` (22 s by default) and overwrites
+  `advanced.irohTransport.connectTimeoutS`. A failed connect marks the peer
+  unresponsive until its record expires; the start-up "home relay URL not
+  known yet" failure does not.
 * Kitsune2 0.5 refuses `http://` relay URLs unless
   `network.advanced.irohTransport.relayAllowPlainText: true`.
 * `hc client call dump-op-timings` prints hashes as raw byte arrays. The
@@ -226,5 +241,9 @@ Other observations from the live runs:
 | Lightweight conductor C, offline while A authored, catches up from B by native Kitsune2 gossip after an HTTP hint, and **validates the ops itself** | **Demonstrated** | `scripts/holochain-three-node-e2e.sh`. Every hinted op is integrated, `Accepted` and `locally_validated: true` in C's own `DumpOpTimings`; A is offline, so the data can only come from B. Control run without the relay's peer hint: no catch-up in 150 s. |
 | Event-driven notification (`OpsIntegrated`) | **Demonstrated with a patched conductor** (not released Holochain) | `MODE=event scripts/holochain-three-node-e2e.sh`; see `results.md` |
 | Missed notifications / relay restarts do not prevent eventual delivery | **Tested** | `crates/relay/tests/holochain_reconcile.rs` (scripted conductor) and the three-node event run (polling reconciles) |
+| Mobile lifecycle: C offline while A authors ≥ 100 ops, B and D (independent relays) validate them, A goes offline (stale record in bootstrap), C wakes, syncs hints from both relays over HTTP, starts, catches up its arc from B/D and validates everything itself | **Demonstrated, on one Linux host** | `scripts/mobile-lifecycle-e2e.sh`, `scripts/lifecycle-benchmarks.sh`; numbers in `results.md` |
+| Fast catch-up despite stale peers by gossiping with the relay-named peer first | **Demonstrated with patched Kitsune2 + Holochain** (`RequestGossipRound`) | lifecycle `round` variant vs `baseline`; Holochain and Kitsune2 tests in `upstream-changes.md` |
+| Storage-arc-aware hints | **Full and zero arcs end to end; partial and wrapping arcs in Rust tests only** | G10; `crates/relay/tests/arc_filter.rs`, lifecycle `zero` variant |
+| Mobile background wake-up | **Not demonstrated** | No device was used. "C" is a desktop conductor process that is stopped and started; nothing here shows an OS waking an app |
 | Op **data** carried by the relay | **No, by design** | The relay carries hints; data moves by Kitsune2 between conductors |
 | Relay as a Kitsune2 module or peer | **Not implemented** | G5; not needed for the demonstrated path |

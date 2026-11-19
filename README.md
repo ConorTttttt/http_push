@@ -9,11 +9,13 @@ independent relays at once; there is no central server.
 > **Status: working prototype.** Relays deliver *hints* (op hashes, signal
 > digests) and their own conductor's signed peer record, never DHT data.
 > A device's conductor catches up by **native Kitsune2 gossip** with the
-> HoloPort and validates the ops itself (three-conductor test). The relay
-> takes no part in gossip. Event-driven notification needs a proposed
-> Holochain change ([docs/upstream-changes.md](docs/upstream-changes.md));
-> released Holochain uses polling. Mobile background wake-up is **not**
-> supported.
+> HoloPort and validates the ops itself (three-conductor test and a mobile
+> lifecycle simulation with two independent relays and a stale peer). The
+> relay takes no part in gossip. Event-driven notification and "gossip with
+> this peer next" need proposed Holochain/Kitsune2 changes
+> ([docs/upstream-changes.md](docs/upstream-changes.md)); released Holochain
+> uses polling and Kitsune2's own peer selection. Mobile background wake-up
+> is **not** supported or demonstrated: no phone was used.
 
 | Piece | State |
 |---|---|
@@ -23,6 +25,9 @@ independent relays at once; there is no central server.
 | Event-driven `OpsIntegrated` source | Implemented behind `--features ops-integrated-signal`; **requires the Holochain patch** in `upstream/` (not released) |
 | Peer hints (`GET /v1/peers`): the HoloPort's own signed agent info | Implemented; enables the device's catch-up gossip in the three-conductor test |
 | Three-conductor catch-up: C offline → HTTP hints → Kitsune2 gossip with B → C validates | Demonstrated (`scripts/holochain-three-node-e2e.sh`, polling and event modes) |
+| Mobile lifecycle simulation: ≥ 100 ops, two independent relays, stale peer, bootstrap on, full and zero arc | Demonstrated on one Linux host (`scripts/mobile-lifecycle-e2e.sh`, `scripts/lifecycle-benchmarks.sh`) |
+| Storage-arc-aware hints (`refs[].loc`, `?arc=`) | Implemented; full/zero arcs end to end, partial/wrapping arcs in Rust tests (Holochain 0.7.1 cannot configure partial arcs) |
+| Requested gossip round with the relay's peer (Kitsune2 `Gossip::request_round`, Holochain `RequestGossipRound`) | **Patches** in `upstream/` (not released); device helper behind `--features request-gossip-round` |
 | Metrics: detection / notification latency, sync duration, op counts, HTTP bytes | Relay (`/admin/v1/metrics`, loopback) and client (`--metrics-out`); results in [docs/results.md](docs/results.md) |
 | `mock` source | **Mock**: synthetic `mock_change` events, labelled `fidelity: mock` |
 | Web Push / APNs / FCM wake-ups, discovery, relay-as-Kitsune2-peer | Not implemented ([docs/architecture.md](docs/architecture.md)) |
@@ -36,8 +41,8 @@ independent relays at once; there is no central server.
 * [docs/holochain-integration.md](docs/holochain-integration.md): checked
   versions, verified APIs, findings, gaps.
 * [docs/upstream-changes.md](docs/upstream-changes.md): proposed Holochain /
-  Kitsune2 changes, kept separate from the relay, including the
-  `OpsIntegrated` patch (`upstream/holochain-0.7.1-ops-integrated.patch`).
+  Kitsune2 changes, kept separate from the relay, with the patch series in
+  `upstream/` (0.7.1 and `main` of each repository).
 * [docs/results.md](docs/results.md): measured latency, sync duration,
   operation counts and HTTP bandwidth.
 
@@ -49,10 +54,13 @@ crates/source-api         ChangeSource trait: the gossip-integration boundary
 crates/holochain-adapter  real conductor sources (holochain_client 0.9.1)
 crates/relay              relay library + `hc-push-relay` binary + mock source
 crates/client             client library + `hc-push-client` CLI
+crates/device             `hc-push-device`: device-side catch-up against the local conductor
 fixtures/happ             minimal test hApp (hdk 0.7.1) for the real-conductor tests
 scripts/                  demo.sh, holochain-{e2e,gossip-e2e,three-node-e2e}.sh,
+                          mobile-lifecycle-e2e.sh, lifecycle-benchmarks.sh,
                           build-patched-holochain.sh
-upstream/                 proposed Holochain 0.7.1 patch (OpsIntegrated)
+upstream/                 proposed patch series: kitsune2-0.5.1/, holochain-0.7.1/,
+                          kitsune2-main/, holochain-main/
 deploy/                   compose.yaml (mock pair / EdgeNode sidecar), Caddyfile, .env.example
 Dockerfile                distroless OCI image (relay + client CLI)
 ```
@@ -64,7 +72,7 @@ crates build bundled SQLCipher and vendored OpenSSL, which also needs `perl`.
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 63 tests: unit, HTTP API, client flows, reconciliation
+cargo test --workspace          # unit, HTTP API, arc filter, client flows, reconciliation
 cargo build -p hc_push_relay --no-default-features   # relay without Holochain deps
 ```
 
@@ -149,6 +157,24 @@ missing op hashes and B's peer record over HTTP; C's conductor then gossips
 with B and the script verifies, from C's own `DumpOpTimings`, that every
 hinted op is integrated, `Accepted` and `locally_validated`. Results are
 written to `.demo/three-node-*/results.json`.
+
+### 3c. Mobile lifecycle: two relays, a stale peer, storage arcs
+
+```sh
+scripts/build-patched-holochain.sh           # patched conductor, relay, client, device helper
+scripts/mobile-lifecycle-e2e.sh              # stock C, ordinary peer selection
+C_HOLOCHAIN=.demo/patched/holochain-0.7.1/target/debug/holochain REQUEST_ROUND=on \
+  scripts/mobile-lifecycle-e2e.sh            # C requests a round with the relays' peers
+C_HOLOCHAIN=.demo/patched/holochain-0.7.1/target/debug/holochain REQUEST_ROUND=on C_ARC=zero \
+  scripts/mobile-lifecycle-e2e.sh            # zero-arc C: no required ops, reads with get
+scripts/lifecycle-benchmarks.sh              # all variants, repeated; raw JSON in docs/results-data/lifecycle/
+```
+
+A authors ≥ 100 ops while C is stopped. B and D, each with its own relay,
+validate them, then A goes offline (its record stays in the bootstrap
+service). C syncs hints from both relays over HTTP, starts with bootstrap
+enabled, and `hc-push-device` hands it B's and D's signed records, then
+waits until every hinted op in C's arc is validated by C itself.
 
 ### 4. Client CLI
 
@@ -237,15 +263,20 @@ The image is distroless and non-root (uid 65532), with health check
   conductor (Kitsune2), which must run for the duration of the catch-up.
 * Released Holochain has no push notification: the source polls (default
   2 s). Event-driven delivery needs the proposed patch (U1).
-* Catch-up time is dominated by Kitsune2 peer selection: with a stale
-  offline peer in the peer store it took 47–84 s, versus about 6 s with only
-  the relay's peer hint (U2/U3 in `docs/upstream-changes.md`). Apps cannot
-  direct a gossip round at the HoloPort.
-* The three-conductor test uses full-arc conductors. A small-arc device
-  would never receive hinted ops outside its arc; hints are not yet
-  arc-filtered (U5).
+* With released Holochain, catch-up time is dominated by Kitsune2 peer
+  selection: with a stale offline peer in the peer store it sometimes waits
+  out connect timeouts first (tens of seconds; `docs/results.md`). The
+  proposed `RequestGossipRound` (U2) removes that; until it is released,
+  lowering `network.request_timeout_s` on the device is the only lever, and
+  it also shortens every other network request.
+* A zero-arc device's first `get` after waking can hit the same stale peer
+  and fail after the connect timeout (U3).
+* Hints from the polling source carry no DHT location, so arc filtering
+  only applies to the event-driven source (U5). Partial arcs cannot be
+  configured in Holochain 0.7.1 (U8).
 * No mobile background wake-up. Nothing here wakes a suspended app; it
-  catches up on its next foreground or OS-scheduled run.
+  catches up on its next foreground or OS-scheduled run. All "device" runs
+  are desktop conductor processes.
 * Coverage per relay is the relay conductor's storage arc for the
   configured app. Relays with different arcs report different subsets.
 * App-signal events are local to the relay's conductor and are deduplicated
@@ -258,8 +289,9 @@ The image is distroless and non-root (uid 65532), with health check
 
 ## Future work
 
-* Upstream the `OpsIntegrated` patch (U1), "gossip with this peer" (U2) and
-  better stale-peer handling (U3); arc-filtered hints (U5); then
+* Upstream the `OpsIntegrated` (U1) and requested-round (U2) patches;
+  stale-peer handling (U3); located hints from the polling path (U5);
+  partial arcs and the target arc in the app API (U8); then
   storage-arc-aware coverage in `/v1/capabilities` from `DumpNetworkMetrics`.
 * Only if on-device Kitsune2 sessions prove too costly: a Kitsune2 HTTP
   transport with the HoloPort as an always-on peer.

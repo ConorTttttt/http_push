@@ -37,11 +37,14 @@ the device itself); the relay tells it *what* is missing and *whom* to ask.
    relay A (HoloPort)             relay B (EdgeNode)       … any number
           ▲                              ▲
           └──── hc-push-client (phone): per-relay cursor, cross-relay dedup,
-                failover, gap notices → app
-                       │ hints = missing op hashes; peers = HoloPort's signed record
+                failover, gap notices, ?arc= (own storage arc) → app
+                       │ hints = missing op hashes + DHT locations;
+                       │ peers = each HoloPort's signed record
                        ▼
-                phone's own conductor ── AddAgentInfo(peers) ── Kitsune2 gossip
-                with the HoloPort ── fetch ── own validation ── integrated
+                hc-push-device: AddAgentInfo(peers) [conductor verifies]
+                  [RequestGossipRound(peer), proposed upstream API]
+                phone's own conductor ── Kitsune2 gossip with the HoloPorts
+                ── fetch ── own validation ── integrated (ops in its arc)
 ```
 
 | Crate | Role |
@@ -51,6 +54,28 @@ the device itself); the relay tells it *what* is missing and *whom* to ask.
 | `crates/holochain-adapter` | Real conductor sources (Holochain 0.7.x app API). |
 | `crates/relay` | HTTP relay library + `hc-push-relay` binary, including the clearly labelled `mock` source. |
 | `crates/client` | Portable client library + `hc-push-client` CLI. |
+| `crates/device` | `hc-push-device`: device-side catch-up against the local conductor (peer records, optional requested gossip round, completion by storage arc, timings). |
+
+### Storage arcs
+
+Kitsune2 stores an op on the agents whose storage arc contains the op's
+location, which Holochain derives from the op's basis hash
+(`docs/holochain-integration.md`). A full-arc HoloPort holds everything; a
+phone may hold a small arc or none.
+
+* The `OpsIntegrated` source labels each op hint with that location
+  (`refs[].loc`); the journal stores it in an indexed column.
+* `/v1/sync` and `/v1/events` take `arc=`. The relay skips hints whose
+  location is known and outside the arc, and always delivers hints whose
+  location it does not know (polling source, app signals, events journaled
+  before the relay knew locations). The filter saves bandwidth; it is not a
+  security boundary.
+* The device helper treats only located hints inside its arc (and, for a
+  full arc, unlocated ones too) as ops it must end up holding. A zero-arc
+  node has none; it reads on demand with `get`.
+* Reconciliation is unchanged: completeness comes from Kitsune2 gossip
+  over the node's own arc, not from hints. A missed or filtered hint only
+  means the device did not know to wake for it.
 
 ## Relay internals
 
@@ -171,6 +196,11 @@ the device itself); the relay tells it *what* is missing and *whom* to ask.
 * The client uses rustls (no OpenSSL) and a current-thread runtime, and
   persists state through a pluggable `StateStore` (atomic JSON file by
   default; apps can use their keystore for tokens).
+* The full wake-up cycle (hints over HTTP while the conductor is stopped,
+  conductor start, catch-up from the HoloPorts, stop) is simulated with
+  desktop conductors in `scripts/mobile-lifecycle-e2e.sh`. **Mobile
+  background wake-up is not demonstrated**: no phone and no OS scheduler
+  were involved.
 
 ## Web Push and native wake-ups (future, optional)
 
@@ -201,9 +231,15 @@ remains the source of truth.
    * U1 `OpsIntegrated` signal: implemented as a patch against 0.7.1 and
      wired into the relay (`OpsIntegratedSource`); polling stays as the
      reconciliation path;
-   * U2/U3 "gossip with this peer now" and better stale-peer handling: the
-     dominant cost of catch-up today;
-   * U5 basis and type in `OpTimingDump` → arc-filterable hints.
+   * U2 "gossip with this peer next" (Kitsune2 `Gossip::request_round` +
+     `AppRequest::RequestGossipRound`): implemented as patches; removes the
+     dominant cost of catch-up with stale peers in the peer store
+     (`results.md`);
+   * U3 stale-peer handling (connect timeout, health-aware selection and
+     `get` targeting): measured, proposed;
+   * U5 basis and type in `OpTimingDump` → arc-filterable hints from the
+     polling path too (the event path already has them);
+   * U8 partial arcs and the target arc in the app API.
 
    No relay protocol change is needed for any of these.
 3. **Only if networking stays too costly on devices.** Step 1 already uses

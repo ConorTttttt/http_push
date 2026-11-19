@@ -44,7 +44,7 @@ retained, or an explicit `410` if it was pruned.
   "space": "uhC0kPQEHCyrIo3XGvsHjYMJU9sNw1AekUKvc0ID_8pFYs8EB275g",
   "kind": "op_integrated",
   "change_key": "1de9e922e110dacbdf87672f36031d45",
-  "refs": [{ "type": "dht_op", "id": "uhCQkUmU0uwXh5FJRhmV45cGIeEI_r3eeQt149NlTBO9wmzkV5i_Y" }],
+  "refs": [{ "type": "dht_op", "id": "uhCQkUmU0uwXh5FJRhmV45cGIeEI_r3eeQt149NlTBO9wmzkV5i_Y", "loc": 2864190519 }],
   "observed_at_ms": 1795050420681,
   "occurred_at_ms": 1795050420310,
   "source": "holochain-op-timings"
@@ -59,7 +59,8 @@ retained, or an explicit `410` if it was pruned.
 | `space` | DNA hash |
 | `kind` | `op_integrated`, `op_rejected`, `app_signal`, `mock_change`; unknown kinds deserialize as `unknown` and should be treated as "something changed in `space`" |
 | `change_key` | See above |
-| `refs` | Opaque references: `dht_op` (DhtOpHash), `digest` (`sha256:<hex>` of a payload the relay does not forward), `mock` |
+| `refs` | Opaque references: `dht_op` (DhtOpHash), `digest` (`sha256:<hex>` of a payload the relay does not forward), `mock`. A ref may carry `loc`, see below |
+| `refs[].loc` | Optional `u32`: the Kitsune2 DHT location of the referenced op, i.e. the location of its basis hash (`AnyLinkableHash::get_loc()`). Kitsune2 stores an op on the agents whose storage arc contains this value. Present when the source knows the basis (the `OpsIntegrated` source); absent from the polling source, whose `DumpOpTimings` does not report it. Not part of `change_key`; unverified like the rest of the hint |
 | `observed_at_ms` | Relay clock, diagnostics only; never order by it |
 | `occurred_at_ms` | Optional. When the change happened at its origin, if the source reports it (Holochain sources: the conductor's integration time). Diagnostics and latency metrics only |
 | `source` | Change source id: `holochain-op-timings` (polling), `holochain-ops-integrated` (event-driven, patched conductor), `holochain-app-signals`, `mock` |
@@ -82,7 +83,9 @@ Protocol versions, `relay_id`, `journal_id`, served `spaces` (unless
 `HC_PUSH_ADVERTISE_SPACES=false`), `sources` with **`fidelity`** (`mock`,
 `conductor_op_level`, `conductor_app_signal`), retention limits, request
 limits, transports (`["sse","sync"]`), `peer_hints` (whether `GET
-/v1/peers` is available) and registration mode (`key`|`open`).
+/v1/peers` is available), `arc_filter` (whether `/v1/sync` and
+`/v1/events` accept `arc`; absent means no) and registration mode
+(`key`|`open`).
 Clients use it to judge coverage. Different relays may serve different
 spaces and have different retention.
 
@@ -110,7 +113,35 @@ too many spaces, unknown field), `401`, `403` (space not served), `413`,
 Bearer subscription token. `204`; `403` if the token belongs to another
 subscription.
 
-### `GET /v1/sync?cursor=<cursor>&limit=<1..500>`
+### Storage-arc filter: `arc=<arc>` on `/v1/sync` and `/v1/events`
+
+A lightweight node only stores the ops whose location lies in its own
+storage arc. It can ask the relay for only the hints relevant to it:
+
+| `arc` value | Meaning |
+|---|---|
+| `full` | every location (same as no parameter) |
+| `empty` | zero arc: no op hint with a known location |
+| `s-e[,s-e…]` | up to 8 inclusive ranges of `u32` locations; `s > e` wraps past `4294967295`, as `kitsune2_api::DhtArc::Arc` does |
+
+* An event is skipped only when **all** its refs carry the same `loc` and
+  that location is outside the arc. Events with no location (polling
+  source, app-signal digests, events journaled before the relay supported
+  locations) are always delivered, because the relay cannot tell. A client
+  must not count such hints as data it is required to hold unless its arc
+  is full.
+* Skipped events still advance `next_cursor`, like events of other spaces.
+* The arc is per request, not per subscription: a node's arc changes over
+  time, and the same subscription can be read with different arcs.
+* `400` for a malformed value. Relays without `arc_filter` reject the
+  unknown parameter with `400`, so clients send it only when
+  `/v1/capabilities` advertises `arc_filter` and otherwise filter after
+  download (the reference client does both).
+* The filter is a bandwidth optimization, not a security boundary: a relay
+  can mislabel locations. Completeness comes from Kitsune2 gossip, not from
+  hints.
+
+### `GET /v1/sync?cursor=<cursor>&limit=<1..500>[&arc=<arc>]`
 
 Bearer subscription token. Returns events with `seq > cursor` in the
 subscription's spaces, ascending:
@@ -137,6 +168,7 @@ subscription's spaces, ascending:
 
 Bearer subscription token. Start position: the `Last-Event-ID` header (sent
 automatically by reconnecting `EventSource`s), else `?cursor=`, else "now".
+Optional `arc=` as above, applied to the replay and to live events.
 
 | SSE event | `id` | `data` |
 |---|---|---|
@@ -202,16 +234,23 @@ on wake / reconnect / timer:
 `seen` is a bounded FIFO (default 10 000 keys), persisted with the cursors.
 
 Catch-up of an on-device conductor (verified in
-`scripts/holochain-three-node-e2e.sh`):
+`scripts/holochain-three-node-e2e.sh` and, with two independent relays,
+a stale peer and storage arcs, `scripts/mobile-lifecycle-e2e.sh`; the
+device side is `crates/device`):
 
 ```
-hints = sync()                              # op hashes the device is missing
-if hints: peers = GET /v1/peers?space=…     # relay's own conductor, signed
-          start conductor; AddAgentInfo(peers)
-          wait until DumpOpTimings shows every hinted op integrated
-          (Kitsune2 gossip + fetch + the device's own validation)
-          stop conductor -> idle
+hints = sync(arc = my storage arc)          # from every relay, deduplicated
+required = hints with loc in my arc         # + unlocated hints if arc is full
+peers = GET /v1/peers?space=… per relay     # relays' own conductors, signed
+start conductor; AddAgentInfo(peers)        # conductor verifies signatures
+[RequestGossipRound(peer) per relay]        # proposed upstream API, optional
+wait until DumpOpTimings shows every required op integrated, Accepted
+and locally validated (Kitsune2 gossip + fetch + own validation)
+stop conductor -> idle
 ```
+
+A zero-arc node has no required ops; it reads data on demand with zome
+`get`, served by the network.
 
 ## Versioning
 
