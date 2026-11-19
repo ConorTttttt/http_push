@@ -266,7 +266,7 @@ C_CLIENT --metrics-out "$WORK/c-metrics.jsonl" peers --relay d >"$WORK/d-peers.j
 C_PEERS_AT=$(now_ms)
 echo "hints received: $(wc -l <"$WORK/c-hints.jsonl") (arc $ARC)"
 
-RELAY_B_CHECK="null"
+echo null >"$WORK/relay-b-check.json"
 if [ "$RELAY_RESTART" = on ]; then
   log "5b. Relay B's journal after its restart: every op A authored, from either path"
   RELAY_B_CHECK=$(python3 -I - "$WORK" <<'PY'
@@ -286,8 +286,9 @@ for o in ops:
 print(json.dumps({"ops": len(ops), "journaled_by_b": len(ops) - len(missing), "missing": len(missing), "by_source": sources}))
 PY
 )
+  echo "$RELAY_B_CHECK" >"$WORK/relay-b-check.json"
   echo "$RELAY_B_CHECK"
-  python3 -I -c 'import json,sys;d=json.loads(sys.argv[1]);s=d["by_source"];sys.exit(0 if d["missing"]==0 and s.get("holochain-op-timings",0)>0 and s.get("holochain-ops-integrated",0)>0 else 1)' "$RELAY_B_CHECK" \
+  python3 -I -c 'import json,sys;d=json.load(open(sys.argv[1]));s=d["by_source"];sys.exit(0 if d["missing"]==0 and s.get("holochain-op-timings",0)>0 and s.get("holochain-ops-integrated",0)>0 else 1)' "$WORK/relay-b-check.json" \
     || fail "relay B did not reconcile the ops it missed while stopped, or events did not resume"
 fi
 
@@ -312,7 +313,7 @@ C_CPU_SYNCED=$(cpu_ms "${PID[c]}")
 python3 -I -c 'import json,sys;d=json.load(open(sys.argv[1]));print(json.dumps({k:d[k] for k in ("synced","hints","progress","t_ms","request_round")},indent=1))' "$WORK/device.json" || cat "$WORK/device.log"
 [ "$DEVICE_EXIT" = 0 ] || fail "C did not validate and integrate its required ops within $SYNC_TIMEOUT s"
 
-GETS="[]"
+echo "[]" >"$WORK/zero-gets.json"
 if [ "$C_ARC" = zero ]; then
   log "8b. zero-arc C reads A's notes with zome get (served by B/D; A is offline)"
   GETS=$(python3 -I - "$WORK" "$C_PORT" "$APP_ID" "$DNA" "$PASS" "$HC" <<'PY'
@@ -340,8 +341,9 @@ for h in (hashes[0], hashes[len(hashes) // 2], hashes[-1]):
 print(json.dumps(out))
 PY
 )
+  echo "$GETS" >"$WORK/zero-gets.json"
   echo "$GETS"
-  python3 -I -c 'import json,sys;g=json.loads(sys.argv[1]);sys.exit(0 if g and all(x["found"] for x in g) else 1)' "$GETS" \
+  python3 -I -c 'import json,sys;g=json.load(open(sys.argv[1]));sys.exit(0 if g and all(x["found"] for x in g) else 1)' "$WORK/zero-gets.json" \
     || fail "zero-arc C could not get A's notes from the network"
   dump c-after.json "$C_PORT"
   HELD=$( ("${OPT[@]}" check "$WORK/c-after.json" "$WORK/new-on-a.txt" 2>/dev/null || true) \
@@ -390,7 +392,7 @@ res = {
     "request_round": "$REQUEST_ROUND", "c_arc": "$C_ARC", "c_bootstrap": "$C_BOOTSTRAP",
     "c_request_timeout_s": "${C_REQUEST_TIMEOUT_S:-60 (default)}", "gossip": "$GOSSIP",
     "stale_peer": "A offline since step 4; its record stays in bootstrap",
-    "relay_b_restart": json.loads('''$RELAY_B_CHECK'''),
+    "relay_b_restart": json.load(open(f"{w}/relay-b-check.json")),
     "notes_authored_by_a": $NOTES,
     "ops_authored_by_a": $NEW_A,
     "b_integrated_after_authoring_ms": $B_SEEN_AT - $AUTHOR_END,
@@ -416,7 +418,7 @@ res = {
         "required_ops": dev["hints"]["required"],
         "progress": dev["progress"],
         "gossip_attempts": attempts,
-        "zero_arc_gets": json.loads('''$GETS'''),
+        "zero_arc_gets": json.load(open(f"{w}/zero-gets.json")),
     },
     "cpu_ms": {"c_startup": $C_CPU_READY, "c_until_synced": $C_CPU_SYNCED, "c_total": $C_CPU_END},
     "bytes": {
