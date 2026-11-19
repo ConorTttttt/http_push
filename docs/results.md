@@ -185,21 +185,36 @@ Run in the patched trees (`upstream/`), with the test-only IPv6 shim where
 a conductor is started. The full Holochain and Kitsune2 suites were **not**
 run.
 
-Kitsune2 `v0.5.1` + `kitsune2-0.5.1/0001` and Holochain `0.7.1` +
-`holochain-0.7.1/0001-0002` (built against the patched Kitsune2). Measured
-before the final rustfmt-only amendment of the series; reruns on the final
-series are in progress:
+Kitsune2 `v0.5.1` + `kitsune2-0.5.1/0001`:
 
 ```
-kitsune2: cargo test -p kitsune2_gossip -p kitsune2_api -p kitsune2_core --lib
-  kitsune2_gossip 71 passed (67 existing + 4 new), kitsune2_api 34, kitsune2_core 108
-holochain: cargo test -p holochain_state --lib -- dht_store::tests::integrate_ready_ops
-  4 passed
-holochain: cargo test -p holochain --lib -- conductor::conductor::app_broadcast
-  8 passed
-holochain: cargo test -p holochain --lib -- conductor::conductor::tests::request_gossip_round
-  1 passed; repeated 6 times: Bob synced 0.2-1.1 s after the request
+cargo test -p kitsune2_gossip -p kitsune2_api -p kitsune2_core --lib
+  kitsune2_api     34 passed
+  kitsune2_core   108 passed
+  kitsune2_gossip  71 passed  (67 existing + 4 new: requested_rounds_tests::{fifo_dedup_and_bounded_retries,
+                               repeated_request_resets_attempts}, request_round_rejects_unknown_peer,
+                               requested_round_syncs_without_waiting_for_the_schedule)
 ```
+
+Holochain `0.7.1` + `holochain-0.7.1/0001-0002`, built against the patched
+Kitsune2 (`--config` with `[patch.crates-io]`):
+
+```
+cargo test -p holochain_state --lib -- dht_store::tests::integrate_ready_ops
+  4 passed   (incl. integrate_ready_ops_notifies_observer_through_clones)
+cargo test -p holochain --lib -- conductor::conductor::app_broadcast \
+    conductor::conductor::tests::request_gossip_round core::workflow::integrate_dht_ops_workflow
+  13 passed  (8 app_broadcast, 4 existing integration-workflow tests,
+             requested_gossip_round_syncs_before_the_schedule)
+cargo test -p holochain_p2p --lib
+  68 passed  (whole crate; the HcP2p trait gained request_gossip_round)
+```
+
+`requested_gossip_round_syncs_before_the_schedule` was also repeated 6
+times: Bob had integrated Alice's ops 0.2–1.1 s after the request every
+time. (An earlier version of the test picked the first URL in the peer
+store, which was sometimes Bob's own; that is why `request_round` now
+refuses the node's own agents.)
 
 Kitsune2 `main` (`1d26e00`) + `kitsune2-main/0001`:
 
