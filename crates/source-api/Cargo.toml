@@ -1,0 +1,17 @@
+[package]
+name = "hc_push_source_api"
+description = "Isolation boundary between the HTTP push relay and whatever observes Holochain / Kitsune2 changes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+hc_push_protocol.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

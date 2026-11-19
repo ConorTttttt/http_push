@@ -1,0 +1,9 @@
+/target
+/fixtures/happ/target
+/fixtures/happ/workdir/*.happ
+/fixtures/happ/workdir/*.dna
+/data
+/.demo
+/.hc*
+*.sqlite3
+*.sqlite3-*

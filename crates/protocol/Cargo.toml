@@ -1,0 +1,14 @@
+[package]
+name = "hc_push_protocol"
+description = "Wire types for the Holochain HTTP push relay protocol (v1). No async runtime; portable to mobile targets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

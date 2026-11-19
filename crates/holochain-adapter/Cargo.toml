@@ -1,0 +1,24 @@
+[package]
+name = "hc_push_holochain"
+description = "Holochain conductor change source for the HTTP push relay (DumpOpTimings poller + app signal digests)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+hc_push_protocol.workspace = true
+hc_push_source_api.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Holochain 0.7.x stable line. These versions were verified against
+# holochain main-0.7 (c5f5028) and crates.io on 2026-11-19.
+holochain_client = { version = "=0.9.1", default-features = false }
+holochain_conductor_api = "=0.7.1"
+holochain_types = "=0.7.1"
