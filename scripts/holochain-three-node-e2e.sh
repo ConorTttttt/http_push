@@ -40,10 +40,10 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MODE=${MODE:-polling}
 GOSSIP=${GOSSIP:-fast}
 C_BOOTSTRAP=${C_BOOTSTRAP:-on}
-PEER_HINT=${PEER_HINT:-on}
+PEER_HINT=${PEER_HINT:-on}               # off: control run, B's record is NOT handed to C
 # network.request_timeout_s for C only (default 60). Holochain sets the iroh
 # connect timeout to floor(3/8 of it): 60 -> 22 s.
-C_REQUEST_TIMEOUT_S=${C_REQUEST_TIMEOUT_S:-}          # off: control run, B's record is NOT handed to C
+C_REQUEST_TIMEOUT_S=${C_REQUEST_TIMEOUT_S:-}
 SYNC_TIMEOUT=${SYNC_TIMEOUT:-300}   # seconds to wait for C to catch up
 EXPECT_SYNC=${EXPECT_SYNC:-1}       # 0: report a timeout instead of failing (control runs)
 NOTES=${NOTES:-5}
