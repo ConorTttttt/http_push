@@ -1,0 +1,227 @@
+{
+  "label": "zero",
+  "c_conductor": "patched 0.7.1 (+K2 request_round)",
+  "request_round": "on",
+  "c_arc": "zero",
+  "c_bootstrap": "on",
+  "c_request_timeout_s": "60 (default)",
+  "gossip": "fast",
+  "stale_peer": "A offline since step 4; its record stays in bootstrap",
+  "relay_b_restart": null,
+  "notes_authored_by_a": 34,
+  "ops_authored_by_a": 102,
+  "b_integrated_after_authoring_ms": 371,
+  "d_integrated_after_authoring_ms": 995,
+  "notification": {
+    "detection_b_or_d_integrated_to_relay_journal": {},
+    "hints_by_relay_journal": {},
+    "hints_with_location": 0,
+    "c_http_sync_ms": 21,
+    "c_http_sync": {
+      "delivered": 0,
+      "duplicates": 0,
+      "transfer": {
+        "requests": 4,
+        "bytes_sent": 570,
+        "bytes_received": 2880
+      },
+      "relays": [
+        {
+          "relay": "b",
+          "ok": true,
+          "pages": 1,
+          "received": 0,
+          "delivered": 0,
+          "duplicates": 0,
+          "outside_arc": 0
+        },
+        {
+          "relay": "d",
+          "ok": true,
+          "pages": 1,
+          "received": 0,
+          "delivered": 0,
+          "duplicates": 0,
+          "outside_arc": 0
+        }
+      ]
+    },
+    "c_peer_records_ms": 120,
+    "c_peer_records_transfer": [
+      {
+        "requests": 1,
+        "bytes_sent": 210,
+        "bytes_received": 730
+      },
+      {
+        "requests": 1,
+        "bytes_sent": 210,
+        "bytes_received": 730
+      }
+    ]
+  },
+  "data_sync": {
+    "conductor_ready_ms": 2105,
+    "own_agent_joined_ms": 2185,
+    "peer_discovery_ms": 2189,
+    "round_requested_ms": 2192,
+    "first_gossip_initiated_ms": 5152,
+    "first_required_op_fetched_ms": null,
+    "required_already_held_at_start": 0,
+    "all_required_ops_validated_ms": 2195,
+    "required_ops": 0,
+    "progress": {
+      "required": 0,
+      "held": 0,
+      "done": 0
+    },
+    "gossip_attempts": [
+      {
+        "at": "2026-11-19T11:52:33.971152Z",
+        "event": "Gossip round requested",
+        "target": "B"
+      },
+      {
+        "at": "2026-11-19T11:52:33.972621Z",
+        "event": "Gossip round requested",
+        "target": "D"
+      },
+      {
+        "at": "2026-11-19T11:52:34.921621Z",
+        "event": "Failed to initiate requested gossip with",
+        "target": "B"
+      },
+      {
+        "at": "2026-11-19T11:52:35.928462Z",
+        "event": "Failed to initiate requested gossip with",
+        "target": "B"
+      },
+      {
+        "at": "2026-11-19T11:52:36.932835Z",
+        "event": "Initiated requested gossip with",
+        "target": "B"
+      },
+      {
+        "at": "2026-11-19T11:52:39.135322Z",
+        "event": "Initiated requested gossip with",
+        "target": "D"
+      }
+    ],
+    "zero_arc_gets": [
+      {
+        "found": true,
+        "total_ms": 44193,
+        "attempts": [
+          {
+            "ms": 43996,
+            "found": false,
+            "error": "Error: External API wire error: InternalError(\"Wasm runtime error while working with Ribosome: RuntimeError: holochain::core::ribosome::host_fn::get:46: Host(\\\""
+          },
+          {
+            "ms": 197,
+            "found": true,
+            "error": null
+          }
+        ]
+      },
+      {
+        "found": true,
+        "total_ms": 194,
+        "attempts": [
+          {
+            "ms": 194,
+            "found": true,
+            "error": null
+          }
+        ]
+      },
+      {
+        "found": true,
+        "total_ms": 204,
+        "attempts": [
+          {
+            "ms": 204,
+            "found": true,
+            "error": null
+          }
+        ]
+      }
+    ]
+  },
+  "cpu_ms": {
+    "c_startup": 2160,
+    "c_until_synced": 2220,
+    "c_total": 3250
+  },
+  "bytes": {
+    "http_in": 4340,
+    "http_out": 990,
+    "kitsune2_open_connections": {
+      "send_bytes": 0,
+      "recv_bytes": 0,
+      "connections": {}
+    }
+  },
+  "device_report": {
+    "synced": true,
+    "arc": "empty",
+    "hints": {
+      "received": 0,
+      "required": 0,
+      "outside_arc": 0,
+      "unlocated_not_required": 0,
+      "other": 0
+    },
+    "progress": {
+      "required": 0,
+      "held": 0,
+      "done": 0
+    },
+    "required_already_held_at_start": 0,
+    "peers": {
+      "records": 2,
+      "urls": [
+        "http://127.0.0.1:44600/b593f19c12cfffd83794245f8e72afb86b8cfa27b23cb572809544d206e66f33",
+        "http://127.0.0.1:44600/7d969620f3acd2394a2078107334d50433371a0d1ff53a8b76ea60a2accf92b0"
+      ],
+      "add_error": null
+    },
+    "request_round": {
+      "requested": true,
+      "results": [
+        {
+          "url": "http://127.0.0.1:44600/b593f19c12cfffd83794245f8e72afb86b8cfa27b23cb572809544d206e66f33",
+          "ok": true,
+          "error": null
+        },
+        {
+          "url": "http://127.0.0.1:44600/7d969620f3acd2394a2078107334d50433371a0d1ff53a8b76ea60a2accf92b0",
+          "ok": true,
+          "error": null
+        }
+      ]
+    },
+    "t_ms": {
+      "tool_started": 2126,
+      "connected": 2182,
+      "own_agent_joined": 2185,
+      "peers_added": 2187,
+      "peers_known": 2189,
+      "round_requested": 2192,
+      "first_required_op_fetched": null,
+      "all_required_ops_validated": 2195
+    },
+    "k2_bytes_open_connections": {
+      "send_bytes": 0,
+      "recv_bytes": 0,
+      "connections": {}
+    },
+    "own_agent": {
+      "agent": "umN6IXQUT5KG8a7mRVzueFxTeFmi9X38YLiNUKbVCK4",
+      "url": "http://127.0.0.1:44600/040461a6a4004130fa06b37317db83155d4e815cf03b60d1faef7a6a3b21d56d",
+      "storageArc": null,
+      "isTombstone": false,
+      "expiresAt": "1795090337621038"
+    }
+  }
+}
