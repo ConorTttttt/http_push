@@ -40,7 +40,10 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MODE=${MODE:-polling}
 GOSSIP=${GOSSIP:-fast}
 C_BOOTSTRAP=${C_BOOTSTRAP:-on}
-PEER_HINT=${PEER_HINT:-on}          # off: control run, B's record is NOT handed to C
+PEER_HINT=${PEER_HINT:-on}
+# network.request_timeout_s for C only (default 60). Holochain sets the iroh
+# connect timeout to floor(3/8 of it): 60 -> 22 s.
+C_REQUEST_TIMEOUT_S=${C_REQUEST_TIMEOUT_S:-}          # off: control run, B's record is NOT handed to C
 SYNC_TIMEOUT=${SYNC_TIMEOUT:-300}   # seconds to wait for C to catch up
 EXPECT_SYNC=${EXPECT_SYNC:-1}       # 0: report a timeout instead of failing (control runs)
 NOTES=${NOTES:-5}
@@ -51,7 +54,7 @@ K2_BOOTSTRAP=${K2_BOOTSTRAP:-kitsune2-bootstrap-srv}
 RELAY=${RELAY:-$ROOT/target/debug/hc-push-relay}
 LEGACY_RELAY=${LEGACY_RELAY:-$ROOT/target/debug/hc-push-relay}
 CLIENT=${CLIENT:-$ROOT/target/debug/hc-push-client}
-WORK=${WORK:-$ROOT/.demo/three-node-$MODE-$GOSSIP-boot$C_BOOTSTRAP-hint$PEER_HINT}
+WORK=${WORK:-$ROOT/.demo/three-node-$MODE-$GOSSIP-boot$C_BOOTSTRAP-hint$PEER_HINT${C_REQUEST_TIMEOUT_S:+-rto$C_REQUEST_TIMEOUT_S}}
 BOOT_PORT=${BOOT_PORT:-44500}
 A_PORT=44551; B_PORT=44552; C_PORT=44553
 RELAY_PORT=${RELAY_PORT:-8792}; RELAY_ADMIN=9792; LEGACY_PORT=8793
@@ -117,6 +120,7 @@ network:
   bootstrap_url: $boot
   relay_url: http://127.0.0.1:$BOOT_PORT
   target_arc_factor: 1
+$( [ "$1" = c ] && [ -n "$C_REQUEST_TIMEOUT_S" ] && echo "  request_timeout_s: $C_REQUEST_TIMEOUT_S" )
   advanced:
     irohTransport:
       relayAllowPlainText: true
@@ -338,7 +342,7 @@ by_source = {}
 for e in events:
     by_source[e["source"]] = by_source.get(e["source"], 0) + 1
 res = {
-    "mode": "$MODE", "gossip": "$GOSSIP", "c_bootstrap_on_restart": "$C_BOOTSTRAP", "peer_hint": "$PEER_HINT", "synced": True, "event_driven_source": $( [ "$EVENT_DRIVEN" = true ] && echo True || echo False ),
+    "mode": "$MODE", "gossip": "$GOSSIP", "c_request_timeout_s": "${C_REQUEST_TIMEOUT_S:-60 (default)}", "c_bootstrap_on_restart": "$C_BOOTSTRAP", "peer_hint": "$PEER_HINT", "synced": True, "event_driven_source": $( [ "$EVENT_DRIVEN" = true ] && echo True || echo False ),
     "notes_authored": $NOTES + 1,
     "ops_new_on_a": $(wc -l <"$WORK/new-on-a.txt"),
     "ops_new_on_b": $(wc -l <"$WORK/new-on-b.txt"),
