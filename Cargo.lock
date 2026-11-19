@@ -1202,6 +1202,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hc_push_device"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "hc_push_holochain",
+ "hc_push_protocol",
+ "holochain_client",
+ "holochain_conductor_api",
+ "holochain_types",
+ "kitsune2_api",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hc_push_holochain"
 version = "0.1.0"
 dependencies = [

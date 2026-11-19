@@ -6,6 +6,7 @@ members = [
   "crates/relay",
   "crates/holochain-adapter",
   "crates/client",
+  "crates/device",
 ]
 
 [workspace.package]

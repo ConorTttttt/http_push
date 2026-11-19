@@ -339,6 +339,14 @@ impl ArcFilter {
         self.ranges.is_empty()
     }
 
+    /// True if some range covers every location (`0-4294967295`, or a
+    /// wrapping range such as `5-4`).
+    pub fn is_full(&self) -> bool {
+        self.ranges
+            .iter()
+            .any(|r| r.start == r.end.wrapping_add(1) || (r.start == 0 && r.end == u32::MAX))
+    }
+
     pub fn contains(&self, loc: u32) -> bool {
         self.ranges.iter().any(|r| r.contains(loc))
     }
@@ -820,6 +828,8 @@ mod tests {
         assert!(zero.admits(&op(None)));
         assert!(zero.admits(&[ChangeRef::new(RefType::Digest, "sha256:00")]));
         let full: ArcFilter = "full".parse().unwrap();
+        assert!(full.is_full() && !half.is_full() && !zero.is_full());
+        assert!("5-4".parse::<ArcFilter>().unwrap().is_full());
         assert!(full.admits(&op(Some(u32::MAX))));
         assert_eq!(full.to_string(), "0-4294967295");
         let two: ArcFilter = "4294967290-5,100-200".parse().unwrap();
