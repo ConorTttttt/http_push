@@ -1,0 +1,199 @@
+{
+  "label": "baseline",
+  "c_conductor": "stock 0.7.1",
+  "request_round": "off",
+  "c_arc": "full",
+  "c_bootstrap": "on",
+  "c_request_timeout_s": "60 (default)",
+  "gossip": "fast",
+  "stale_peer": "A offline since step 4; its record stays in bootstrap",
+  "relay_b_restart": null,
+  "notes_authored_by_a": 34,
+  "ops_authored_by_a": 102,
+  "b_integrated_after_authoring_ms": 79,
+  "d_integrated_after_authoring_ms": 411,
+  "notification": {
+    "detection_b_or_d_integrated_to_relay_journal": {
+      "count": 104,
+      "p50_ms": 13,
+      "max_ms": 13
+    },
+    "hints_by_relay_journal": {
+      "d7b2b858c55585fe": 104
+    },
+    "hints_with_location": 104,
+    "c_http_sync_ms": 37,
+    "c_http_sync": {
+      "delivered": 104,
+      "duplicates": 102,
+      "transfer": {
+        "requests": 6,
+        "bytes_sent": 998,
+        "bytes_received": 88553
+      },
+      "relays": [
+        {
+          "relay": "b",
+          "ok": true,
+          "pages": 2,
+          "received": 104,
+          "delivered": 104,
+          "duplicates": 0,
+          "outside_arc": 0
+        },
+        {
+          "relay": "d",
+          "ok": true,
+          "pages": 2,
+          "received": 102,
+          "delivered": 0,
+          "duplicates": 102,
+          "outside_arc": 0
+        }
+      ]
+    },
+    "c_peer_records_ms": 127,
+    "c_peer_records_transfer": [
+      {
+        "requests": 1,
+        "bytes_sent": 210,
+        "bytes_received": 730
+      },
+      {
+        "requests": 1,
+        "bytes_sent": 210,
+        "bytes_received": 730
+      }
+    ]
+  },
+  "data_sync": {
+    "conductor_ready_ms": 2203,
+    "own_agent_joined_ms": 2280,
+    "peer_discovery_ms": 2289,
+    "round_requested_ms": null,
+    "first_gossip_initiated_ms": 69230,
+    "first_required_op_fetched_ms": 69371,
+    "required_already_held_at_start": 2,
+    "all_required_ops_validated_ms": 70526,
+    "required_ops": 104,
+    "progress": {
+      "required": 104,
+      "held": 104,
+      "done": 104
+    },
+    "gossip_attempts": [
+      {
+        "at": "2026-11-19T11:41:17.304153Z",
+        "event": "Failed to initiate gossip",
+        "target": "not logged"
+      },
+      {
+        "at": "2026-11-19T11:41:18.312530Z",
+        "event": "Failed to initiate gossip",
+        "target": "not logged"
+      },
+      {
+        "at": "2026-11-19T11:42:22.302876Z",
+        "event": "Failed to initiate gossip",
+        "target": "not logged"
+      },
+      {
+        "at": "2026-11-19T11:42:23.305937Z",
+        "event": "Initiated gossip with",
+        "target": "D"
+      },
+      {
+        "at": "2026-11-19T11:42:24.308127Z",
+        "event": "Initiated gossip with",
+        "target": "B"
+      }
+    ],
+    "zero_arc_gets": []
+  },
+  "cpu_ms": {
+    "c_startup": 2230,
+    "c_until_synced": 4640,
+    "c_total": 4640
+  },
+  "bytes": {
+    "http_in": 90013,
+    "http_out": 1418,
+    "kitsune2_open_connections": {
+      "send_bytes": 20112,
+      "recv_bytes": 69478,
+      "connections": {
+        "e495b970e69480352de2fbc23fa34722f47871f1fe80dacdfc4854c7b9303ab9": [
+          14774,
+          61086
+        ],
+        "e5d428372d8b81d8dcc8663ba350892064c5a7e37f6656d3c74945f168183246": [
+          5338,
+          8392
+        ]
+      }
+    }
+  },
+  "device_report": {
+    "synced": true,
+    "arc": "0-4294967295",
+    "hints": {
+      "received": 104,
+      "required": 104,
+      "outside_arc": 0,
+      "unlocated_not_required": 0,
+      "other": 0
+    },
+    "progress": {
+      "required": 104,
+      "held": 104,
+      "done": 104
+    },
+    "required_already_held_at_start": 2,
+    "peers": {
+      "records": 2,
+      "urls": [
+        "http://127.0.0.1:44600/e5d428372d8b81d8dcc8663ba350892064c5a7e37f6656d3c74945f168183246",
+        "http://127.0.0.1:44600/e495b970e69480352de2fbc23fa34722f47871f1fe80dacdfc4854c7b9303ab9"
+      ],
+      "add_error": null
+    },
+    "request_round": {
+      "requested": false,
+      "results": []
+    },
+    "t_ms": {
+      "tool_started": 2225,
+      "connected": 2278,
+      "own_agent_joined": 2280,
+      "peers_added": 2287,
+      "peers_known": 2289,
+      "round_requested": null,
+      "first_required_op_fetched": 69371,
+      "all_required_ops_validated": 70526
+    },
+    "k2_bytes_open_connections": {
+      "send_bytes": 20112,
+      "recv_bytes": 69478,
+      "connections": {
+        "e495b970e69480352de2fbc23fa34722f47871f1fe80dacdfc4854c7b9303ab9": [
+          14774,
+          61086
+        ],
+        "e5d428372d8b81d8dcc8663ba350892064c5a7e37f6656d3c74945f168183246": [
+          5338,
+          8392
+        ]
+      }
+    },
+    "own_agent": {
+      "agent": "oYxqK2ffRLG1aBO5KrKjciCbOv5mW9-L-D0H9ejS2k8",
+      "url": "http://127.0.0.1:44600/2c00885314ca3ca4242b80582369bb851915d5fad3ec264ff917ffa15d1bd62f",
+      "storageArc": [
+        0,
+        4294967295
+      ],
+      "isTombstone": false,
+      "expiresAt": "1795089743472956"
+    }
+  }
+}
