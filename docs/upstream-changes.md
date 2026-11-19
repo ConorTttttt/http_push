@@ -131,6 +131,12 @@ crates/holochain/src/core/queue_consumer.rs                install the observer 
   objects through rather than panicking, but has no subscribe call).
 * Warrant ops are reported with their validity like any other op; their
   semantics for apps are not explored.
+* Ordering: each batch is delivered from its own spawned task, so signals
+  from two back-to-back batches can arrive out of order. Consumers must not
+  rely on signal order (the relay does not; its journal orders by arrival).
+* For self-authored ops the signal's `when_integrated` is the flush time,
+  while `DumpOpTimings` reports the action timestamp for them. The two
+  differ by the time between authoring and commit.
 
 ---
 
@@ -156,8 +162,8 @@ scoped to the app's DNAs. The relay already supplies the peer record
 **Observed.** With bootstrap enabled, C's peer store contains the offline
 A. Selection prefers the *least recently gossiped* responsive peer, so C
 repeatedly picks A. Each attempt waits for the transport connect timeout
-(roughly a minute observed) before failing. Measured catch-up: 48–84 s with
-bootstrap, versus 6.4 s when C knew only B from the relay hint
+(roughly a minute observed) before failing. Measured catch-up: 47–84 s with
+bootstrap, versus about 6 s when C knew only B from the relay hint
 (`docs/results.md`).
 
 **Proposal.** During initial sync after a restart, prefer peers that are

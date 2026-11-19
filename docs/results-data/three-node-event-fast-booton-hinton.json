@@ -1,0 +1,130 @@
+{
+  "mode": "event",
+  "gossip": "fast",
+  "c_bootstrap_on_restart": "on",
+  "peer_hint": "on",
+  "synced": true,
+  "event_driven_source": true,
+  "notes_authored": 6,
+  "ops_new_on_a": 15,
+  "ops_new_on_b": 18,
+  "ops_hinted_to_c": 18,
+  "ops_validated_by_c": 18,
+  "hint_sources": {
+    "holochain-ops-integrated": 18,
+    "holochain-app-signals": 1
+  },
+  "authoring_ms": 1108,
+  "author_to_b_integrated_ms": 1741,
+  "relay_detection_latency": {
+    "holochain-app-signals": {
+      "count": 1,
+      "mean_s": 0.001,
+      "min_s": 0.001,
+      "max_s": 0.001
+    },
+    "holochain-op-timings": {
+      "count": 32,
+      "mean_s": 5.218656250000004,
+      "min_s": 0.105,
+      "max_s": 8.558
+    },
+    "holochain-ops-integrated": {
+      "count": 20,
+      "mean_s": 0.004300000000000002,
+      "min_s": 0.003,
+      "max_s": 0.006
+    }
+  },
+  "observer_sse": {
+    "delivered": 19,
+    "latency": {
+      "relay_to_app": {
+        "count": 19,
+        "min_ms": 0,
+        "p50_ms": 1,
+        "p95_ms": 6,
+        "max_ms": 7
+      },
+      "origin_to_app": {
+        "count": 19,
+        "min_ms": 2,
+        "p50_ms": 5,
+        "p95_ms": 12,
+        "max_ms": 13
+      }
+    },
+    "transfer": {
+      "requests": 1,
+      "bytes_sent": 217,
+      "bytes_received": 8616
+    }
+  },
+  "c_hint_sync": {
+    "duration_ms": 5,
+    "delivered": 19,
+    "transfer": {
+      "requests": 1,
+      "bytes_sent": 189,
+      "bytes_received": 7778
+    }
+  },
+  "c_peer_hint_request": {
+    "requests": 1,
+    "bytes_sent": 210,
+    "bytes_received": 730
+  },
+  "c_gossip_sync_ms": 69709,
+  "c_conductor_ready_ms": 2370,
+  "c_agent_rejoined_ms": 2428,
+  "c_knows_b_ms": 2447,
+  "c_phases": {
+    "ops_already_held": 0,
+    "ops_fetched_after_restart": 18,
+    "first_received_ms": 68331,
+    "last_received_ms": 68370,
+    "last_integrated_ms": 69341
+  },
+  "c_gossip_attempts": [
+    {
+      "at": "2026-11-19T10:00:32.971583Z",
+      "event": "Failed to initiate gossip",
+      "target": "other peer (A, offline)"
+    },
+    {
+      "at": "2026-11-19T10:01:37.024565Z",
+      "event": "Failed to initiate gossip",
+      "target": "other peer (A, offline)"
+    },
+    {
+      "at": "2026-11-19T10:01:38.027820Z",
+      "event": "Initiated gossip with",
+      "target": "B"
+    }
+  ],
+  "hinted_ops_detection_ms": {
+    "count": 18,
+    "min_ms": 3,
+    "p50_ms": 4,
+    "max_ms": 6
+  },
+  "c_offline_ms": 26910,
+  "relay_http": {
+    "response_body_bytes": {
+      "/v1/capabilities": 1068,
+      "/v1/events": 8451,
+      "/v1/health": 343,
+      "/v1/peers": 596,
+      "/v1/subscriptions": 550,
+      "/v1/sync": 7859
+    },
+    "requests": {
+      "/v1/capabilities 200": 1,
+      "/v1/events 200": 1,
+      "/v1/health 200": 1,
+      "/v1/peers 200": 1,
+      "/v1/subscriptions 201": 2,
+      "/v1/sync 200": 3
+    }
+  }
+}

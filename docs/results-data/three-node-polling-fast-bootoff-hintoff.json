@@ -1,0 +1,1 @@
+{"mode":"polling","peer_hint":"off","c_bootstrap_on_restart":"off","synced":false,"timeout_s":150,"c_check":{"expected": 18, "ok": false, "missing": 18, "not_integrated": 0, "not_accepted": 0, "not_locally_validated": 0, "held_total": 34}}

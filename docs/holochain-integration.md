@@ -180,7 +180,7 @@ What a relay can and cannot do:
 | G5 | Kitsune2 module factories cannot be supplied from outside the conductor | A `ReportFactory` that would observe every fetched op cannot be added without patching Holochain | Conductor config hook for extra K2 report/observer modules |
 | G6 | Holochain's websocket `dual_bind` aborts when the kernel has no IPv6 (`EAFNOSUPPORT`); it only falls back on `EADDRNOTAVAIL` | The conductor cannot start on IPv6-less hosts. The e2e scripts work around this with a test-only `LD_PRELOAD` errno shim (`scripts/support/no-ipv6-shim.c`) | Treat `ErrorKind::Unsupported`/`EAFNOSUPPORT` like `AddrNotAvailable` in `holochain_websocket::dual_bind` (unchanged on `main` as of `90198dd`) |
 | G7 | No API to start a gossip round with a chosen peer | A restarted lightweight node cannot say "sync with this HoloPort now" | U2 in `upstream-changes.md` |
-| G8 | Gossip target selection keeps choosing an offline peer whose record has not expired | Catch-up after restart took 48–84 s with bootstrap (each attempt waits out a transport connect timeout) vs 6.4 s with only the relay-supplied peer | U3 in `upstream-changes.md` |
+| G8 | Gossip target selection keeps choosing an offline peer whose record has not expired | Catch-up after restart took 47–84 s with bootstrap (each attempt waits out a transport connect timeout) vs about 6 s with only the relay-supplied peer | U3 in `upstream-changes.md` |
 | G9 | `holochain_client` 0.9.1 panics on any signal variant it cannot decode | New system signals must be opt-in per connection | U4 in `upstream-changes.md` |
 
 The proposed fixes, and the one implemented patch, are collected in

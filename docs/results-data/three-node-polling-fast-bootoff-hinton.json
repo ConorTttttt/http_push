@@ -1,0 +1,119 @@
+{
+  "mode": "polling",
+  "gossip": "fast",
+  "c_bootstrap_on_restart": "off",
+  "peer_hint": "on",
+  "synced": true,
+  "event_driven_source": false,
+  "notes_authored": 6,
+  "ops_new_on_a": 15,
+  "ops_new_on_b": 18,
+  "ops_hinted_to_c": 18,
+  "ops_validated_by_c": 18,
+  "hint_sources": {
+    "holochain-app-signals": 1,
+    "holochain-op-timings": 18
+  },
+  "authoring_ms": 1073,
+  "author_to_b_integrated_ms": 1188,
+  "relay_detection_latency": {
+    "holochain-app-signals": {
+      "count": 1,
+      "mean_s": 0.001,
+      "min_s": 0.001,
+      "max_s": 0.001
+    },
+    "holochain-op-timings": {
+      "count": 52,
+      "mean_s": 3.614057692307691,
+      "min_s": 0.109,
+      "max_s": 8.516
+    }
+  },
+  "observer_sse": {
+    "delivered": 19,
+    "latency": {
+      "relay_to_app": {
+        "count": 19,
+        "min_ms": 1,
+        "p50_ms": 9,
+        "p95_ms": 15,
+        "max_ms": 16
+      },
+      "origin_to_app": {
+        "count": 19,
+        "min_ms": 2,
+        "p50_ms": 246,
+        "p95_ms": 380,
+        "max_ms": 381
+      }
+    },
+    "transfer": {
+      "requests": 1,
+      "bytes_sent": 217,
+      "bytes_received": 8544
+    }
+  },
+  "c_hint_sync": {
+    "duration_ms": 5,
+    "delivered": 19,
+    "transfer": {
+      "requests": 1,
+      "bytes_sent": 189,
+      "bytes_received": 7706
+    }
+  },
+  "c_peer_hint_request": {
+    "requests": 1,
+    "bytes_sent": 210,
+    "bytes_received": 730
+  },
+  "c_gossip_sync_ms": 6377,
+  "c_conductor_ready_ms": 2343,
+  "c_agent_rejoined_ms": 4985,
+  "c_knows_b_ms": 5271,
+  "c_phases": {
+    "ops_already_held": 0,
+    "ops_fetched_after_restart": 18,
+    "first_received_ms": 5166,
+    "last_received_ms": 5196,
+    "last_integrated_ms": 6182
+  },
+  "c_gossip_attempts": [
+    {
+      "at": "2026-11-19T09:55:13.224569Z",
+      "event": "Initiated gossip with",
+      "target": "B"
+    },
+    {
+      "at": "2026-11-19T09:55:14.228606Z",
+      "event": "Initiated gossip with",
+      "target": "B"
+    }
+  ],
+  "hinted_ops_detection_ms": {
+    "count": 18,
+    "min_ms": 237,
+    "p50_ms": 237,
+    "max_ms": 365
+  },
+  "c_offline_ms": 26617,
+  "relay_http": {
+    "response_body_bytes": {
+      "/v1/capabilities": 819,
+      "/v1/events": 8379,
+      "/v1/health": 259,
+      "/v1/peers": 596,
+      "/v1/subscriptions": 550,
+      "/v1/sync": 7787
+    },
+    "requests": {
+      "/v1/capabilities 200": 1,
+      "/v1/events 200": 1,
+      "/v1/health 200": 1,
+      "/v1/peers 200": 1,
+      "/v1/subscriptions 201": 2,
+      "/v1/sync 200": 3
+    }
+  }
+}

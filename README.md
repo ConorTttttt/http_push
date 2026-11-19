@@ -64,7 +64,7 @@ crates build bundled SQLCipher and vendored OpenSSL, which also needs `perl`.
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 53 tests: unit + HTTP API + client flows
+cargo test --workspace          # 63 tests: unit, HTTP API, client flows, reconciliation
 cargo build -p hc_push_relay --no-default-features   # relay without Holochain deps
 ```
 
@@ -238,8 +238,8 @@ The image is distroless and non-root (uid 65532), with health check
 * Released Holochain has no push notification: the source polls (default
   2 s). Event-driven delivery needs the proposed patch (U1).
 * Catch-up time is dominated by Kitsune2 peer selection: with a stale
-  offline peer in the peer store it took 48–84 s, versus 6.4 s with only the
-  relay's peer hint (U2/U3 in `docs/upstream-changes.md`). Apps cannot
+  offline peer in the peer store it took 47–84 s, versus about 6 s with only
+  the relay's peer hint (U2/U3 in `docs/upstream-changes.md`). Apps cannot
   direct a gossip round at the HoloPort.
 * The three-conductor test uses full-arc conductors. A small-arc device
   would never receive hinted ops outside its arc; hints are not yet
