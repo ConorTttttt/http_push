@@ -9,13 +9,18 @@
 #   round          patched C + RequestGossipRound with the relays' peers
 #   zero           patched C, zero storage arc, + RequestGossipRound
 #   zero-rto8      as zero, with request_timeout_s 8
+#   round-relay-restart  as round, and relay B is stopped while A authors the
+#                  middle third of the notes (missed OpsIntegrated notices)
 #
-# Env: VARIANTS (space separated), REPS, plus everything the e2e script takes.
+# Env: VARIANTS (space separated), REPS, FIRST (index of the first run, to
+# add runs without overwriting earlier ones), plus everything the e2e
+# script takes.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${OUT:-$ROOT/docs/results-data/lifecycle}
 REPS=${REPS:-3}
-VARIANTS=${VARIANTS:-baseline rto8 patched-noreq round zero zero-rto8}
+FIRST=${FIRST:-1}
+VARIANTS=${VARIANTS:-baseline rto8 patched-noreq round zero zero-rto8 round-relay-restart}
 HOLOCHAIN=${HOLOCHAIN:-holochain}
 HOLOCHAIN_PATCHED=${HOLOCHAIN_PATCHED:-$ROOT/.demo/patched/holochain-0.7.1/target/debug/holochain}
 mkdir -p "$OUT" "$ROOT/.demo/bench"
@@ -27,9 +32,10 @@ for v in $VARIANTS; do
     round)         env=(C_HOLOCHAIN="$HOLOCHAIN_PATCHED" REQUEST_ROUND=on) ;;
     zero)          env=(C_HOLOCHAIN="$HOLOCHAIN_PATCHED" REQUEST_ROUND=on C_ARC=zero) ;;
     zero-rto8)     env=(C_HOLOCHAIN="$HOLOCHAIN_PATCHED" REQUEST_ROUND=on C_ARC=zero C_REQUEST_TIMEOUT_S=8) ;;
+    round-relay-restart) env=(C_HOLOCHAIN="$HOLOCHAIN_PATCHED" REQUEST_ROUND=on RELAY_RESTART=on) ;;
     *) echo "unknown variant $v" >&2; exit 2 ;;
   esac
-  for i in $(seq 1 "$REPS"); do
+  for i in $(seq "$FIRST" $((FIRST + REPS - 1))); do
     work="$ROOT/.demo/bench/$v-$i"
     echo "== $v run $i"
     if env "${env[@]}" WORK="$work" LABEL="$v" bash "$ROOT/scripts/mobile-lifecycle-e2e.sh" >"$work.log" 2>&1; then

@@ -5,7 +5,7 @@ import os
 import statistics
 import sys
 
-ORDER = ["baseline", "rto8", "patched-noreq", "round", "zero", "zero-rto8"]
+ORDER = ["baseline", "rto8", "patched-noreq", "round", "round-relay-restart", "zero", "zero-rto8"]
 
 
 def fmt(vals, unit=""):
