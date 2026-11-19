@@ -2,6 +2,7 @@
 
 use crate::auth::{self, parse_bearer};
 use crate::journal::{Journal, JournalError, StoredSubscription};
+use crate::metrics::Metrics;
 use crate::rate_limit::RateLimiter;
 use crate::settings::RelaySettings;
 use crate::sse;
@@ -13,12 +14,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use hc_push_protocol::PeersResponse;
 use hc_push_protocol::{
     ApiError, Capabilities, Cursor, ErrorBody, ErrorCode, EventEnvelope, Health, HealthStatus,
     LimitsInfo, RegistrationMode, RetentionInfo, SourceHealth, SourceInfo, SourceState,
     SubscribeRequest, SubscribeResponse, SyncPage, PROTOCOL_VERSION,
 };
-use hc_push_source_api::{now_ms, CancellationToken, HealthHandle};
+use hc_push_source_api::{now_ms, CancellationToken, DynPeerHints, HealthHandle};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -41,9 +43,14 @@ pub struct AppState {
     pub sse_slots: Arc<Semaphore>,
     pub sse_per_sub: Arc<Mutex<HashMap<String, usize>>>,
     pub shutdown: CancellationToken,
+    pub metrics: Arc<Metrics>,
+    /// Signed peer records of the conductor next to this relay, if the
+    /// source supports it (`GET /v1/peers`).
+    pub peers: Option<DynPeerHints>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         settings: RelaySettings,
         journal: Arc<Journal>,
@@ -51,6 +58,8 @@ impl AppState {
         live: broadcast::Sender<Arc<Vec<EventEnvelope>>>,
         sources: Vec<(SourceInfo, HealthHandle)>,
         shutdown: CancellationToken,
+        metrics: Arc<Metrics>,
+        peers: Option<DynPeerHints>,
     ) -> Self {
         Self {
             sub_rate: RateLimiter::new(settings.rate_per_minute, settings.rate_burst, 100_000),
@@ -67,6 +76,8 @@ impl AppState {
             live,
             sources,
             shutdown,
+            metrics,
+            peers,
         }
     }
 
@@ -306,6 +317,7 @@ async fn capabilities(State(state): State<SharedState>) -> Json<Capabilities> {
             sse_replay_limit: s.sse_replay_limit,
         },
         transports: vec!["sse".into(), "sync".into()],
+        peer_hints: state.peers.is_some(),
         registration: s.registration_mode,
     })
 }
@@ -467,6 +479,7 @@ async fn sync(
         j.read_after(after, &spaces, limit)
     })
     .await?;
+    state.metrics.record_sync_page(res.events.len());
     let page = SyncPage {
         events: res.events,
         next_cursor: state.cursor(res.next_seq),
@@ -474,6 +487,52 @@ async fn sync(
         has_more: res.has_more,
     };
     let mut resp = Json(page).into_response();
+    resp.headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    Ok(resp)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeersQuery {
+    pub space: String,
+}
+
+/// `GET /v1/peers?space=...`: signed peer records of this relay's own
+/// conductor, so a client's conductor can gossip with it directly.
+async fn peers(
+    State(state): State<SharedState>,
+    AuthedSub(sub): AuthedSub,
+    query: Result<Query<PeersQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, ApiErr> {
+    let Query(q) = query.map_err(|e| ApiErr::bad_request(e.body_text()))?;
+    if !sub.spaces.contains(&q.space) {
+        return Err(ApiErr::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Forbidden,
+            "space is not part of this subscription",
+        ));
+    }
+    let Some(provider) = &state.peers else {
+        return Err(ApiErr::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "this relay does not offer peer hints",
+        ));
+    };
+    let agent_infos = provider.peer_hints(&q.space).await.map_err(|e| {
+        tracing::warn!(error = %e, "peer hints unavailable");
+        ApiErr::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "conductor unavailable",
+        )
+    })?;
+    let mut resp = Json(PeersResponse {
+        space: q.space,
+        agent_infos,
+    })
+    .into_response();
     resp.headers_mut()
         .insert("cache-control", HeaderValue::from_static("no-store"));
     Ok(resp)
@@ -495,6 +554,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/subscriptions", post(subscribe))
         .route("/v1/subscriptions/{id}", delete(unsubscribe))
         .route("/v1/sync", get(sync))
+        .route("/v1/peers", get(peers))
         .layer(ConcurrencyLimitLayer::new(
             state.settings.max_concurrent_requests,
         ))
@@ -510,6 +570,10 @@ pub fn router(state: SharedState) -> Router {
         .merge(stream_routes)
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(state.settings.max_body_bytes))
+        .layer(axum::middleware::from_fn_with_state(
+            state.metrics.clone(),
+            crate::metrics::track,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

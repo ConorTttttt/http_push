@@ -14,18 +14,23 @@ path = "src/main.rs"
 default = ["holochain"]
 # Real conductor integration (holochain_client 0.9.x / Holochain 0.7.x).
 holochain = ["dep:hc_push_holochain"]
+# Event-driven `SystemSignal::OpsIntegrated` (needs the patched Holochain crates
+# from upstream/; see docs/upstream-changes.md).
+ops-integrated-signal = ["holochain", "hc_push_holochain/ops-integrated-signal"]
 
 [dependencies]
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
+bytes.workspace = true
 clap.workspace = true
 futures.workspace = true
 hc_push_holochain = { workspace = true, optional = true }
 hc_push_protocol.workspace = true
 hc_push_source_api.workspace = true
 hex.workspace = true
+http-body.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

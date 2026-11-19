@@ -36,7 +36,24 @@ pub struct ObservedChange {
     pub space: String,
     pub kind: ChangeKind,
     pub refs: Vec<ChangeRef>,
+    /// When the change happened at its origin (unix ms), if the source knows,
+    /// e.g. the conductor's integration time. Used for latency metrics only.
+    pub occurred_at_ms: Option<u64>,
 }
+
+/// Optional capability of a source: signed peer records (Kitsune2
+/// `AgentInfoSigned` JSON) of the conductor the relay runs next to.
+///
+/// Clients add these to their own conductor so that it can gossip directly
+/// with this always-on peer. The relay only vouches for its *own* conductor;
+/// the records are signed by that conductor's agents and verified by the
+/// client's conductor, so the relay cannot forge another peer.
+pub trait PeerHints: Send + Sync + 'static {
+    fn peer_hints(&self, space: &str) -> BoxFuture<'_, anyhow::Result<Vec<String>>>;
+}
+
+/// Shared handle to a [`PeerHints`] implementation.
+pub type DynPeerHints = std::sync::Arc<dyn PeerHints>;
 
 /// A batch of changes plus the source checkpoint that covers them.
 #[derive(Debug)]

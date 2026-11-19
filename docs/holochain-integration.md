@@ -173,14 +173,40 @@ What a relay can and cannot do:
 
 | # | Gap | Effect today | Smallest core change |
 |---|---|---|---|
-| G1 | No push notification for integrated ops on the app API | Relay polls `DumpOpTimings` (default 2 s), and re-scans from the oldest op still pending validation | Additive `SystemSignal::OpsIntegrated { dna_hash, ops: Vec<DhtOpHash> }` (opt-in per app interface), emitted next to `new_integrated_data` in `integrate_dht_ops_workflow` |
+| G1 | No push notification for integrated ops on the app API | Relay polls `DumpOpTimings` (default 2 s), and re-scans from the oldest op still pending validation | **U1, implemented as a patch** (`upstream-changes.md`): opt-in per connection `SystemSignal::OpsIntegrated`, emitted after commit from both integration paths |
 | G2 | `OpTimingDump` has no basis hash, op type or action hash | Clients get "something changed in DNA X" plus an op hash they cannot fetch with zome `get`, so they re-run app queries | Add `basis_hash` and `op_type` (and `action_hash` for chain ops) to `OpTimingDump` |
 | G3 | `DumpOpTimings` cursor orders by local `when_received` | If the host clock steps backwards, ops can be stamped before the saved cursor and missed until a full rescan | Cursor over a monotonic local sequence (e.g. integration rowid) |
 | G4 | No app-API way to fetch raw op data by op hash for forwarding into another conductor's `process_incoming_ops` | Real op-level sync to phones must go through Kitsune2 itself | Either an app-API `FetchOps(op_ids)` returning `DhtOp`s plus an "ingest ops" API on the receiving conductor that runs normal validation, or (preferred) the Kitsune2 transport route in `architecture.md` |
 | G5 | Kitsune2 module factories cannot be supplied from outside the conductor | A `ReportFactory` that would observe every fetched op cannot be added without patching Holochain | Conductor config hook for extra K2 report/observer modules |
 | G6 | Holochain's websocket `dual_bind` aborts when the kernel has no IPv6 (`EAFNOSUPPORT`); it only falls back on `EADDRNOTAVAIL` | The conductor cannot start on IPv6-less hosts. The e2e scripts work around this with a test-only `LD_PRELOAD` errno shim (`scripts/support/no-ipv6-shim.c`) | Treat `ErrorKind::Unsupported`/`EAFNOSUPPORT` like `AddrNotAvailable` in `holochain_websocket::dual_bind` (unchanged on `main` as of `90198dd`) |
+| G7 | No API to start a gossip round with a chosen peer | A restarted lightweight node cannot say "sync with this HoloPort now" | U2 in `upstream-changes.md` |
+| G8 | Gossip target selection keeps choosing an offline peer whose record has not expired | Catch-up after restart took 48–84 s with bootstrap (each attempt waits out a transport connect timeout) vs 6.4 s with only the relay-supplied peer | U3 in `upstream-changes.md` |
+| G9 | `holochain_client` 0.9.1 panics on any signal variant it cannot decode | New system signals must be opt-in per connection | U4 in `upstream-changes.md` |
+
+The proposed fixes, and the one implemented patch, are collected in
+[`upstream-changes.md`](upstream-changes.md), separate from the relay docs.
 
 Other observations from the live runs:
+
+* **Two ways an op becomes integrated.** Ops from other peers go through
+  validation and `integrate_dht_ops_workflow`. An agent's *own* ops are
+  written by `SourceChain::flush` directly as integrated (`when_received =
+  when_integrated = action timestamp`, `locally_validated = true`), without
+  that workflow. A notification hook on the workflow alone misses them. The
+  three-node event test found this, and the patch hooks the `DhtStore`
+  instead.
+* **Catching up an offline conductor needs nothing new in Kitsune2.** The
+  existing gossip (DHT model diff, new-ops bookmarks) and fetch deliver the
+  missing ops, and `process_incoming_ops` runs the device's own validation.
+  What a lightweight node lacks is (a) knowing *whether and what* it is
+  missing, so it can start networking only when needed and stop when done,
+  and (b) a reachable peer that holds the data. The relay supplies both:
+  hints (op hashes) and the HoloPort's signed agent info (`GET /v1/peers` →
+  `AddAgentInfo`).
+* **Transient SQLite busy errors.** The restarted conductor C logged
+  `SQLITE_BUSY` (5) / `SQLITE_BUSY_SNAPSHOT` (517) from
+  `integrate_dht_ops_consumer`. The workflow retried and every op
+  integrated.
 
 * Kitsune2 0.5 refuses `http://` relay URLs unless
   `network.advanced.irohTransport.relayAllowPlainText: true`.
@@ -197,5 +223,8 @@ Other observations from the live runs:
 | Real zome call → integrated DHT ops → relay → HTTP client | **Demonstrated** | `scripts/holochain-e2e.sh`. All reported op hashes are cross-checked against the conductor's own `DumpOpTimings` as integrated and `Accepted`. |
 | Op authored on conductor A, delivered by Kitsune2 to B, validated on B → relay on B → client | **Demonstrated** | `scripts/holochain-gossip-e2e.sh` (local bootstrap + iroh relay, two conductors) |
 | Op-level hints come from Holochain's validation pipeline | Yes, for the relay's own conductor | `when_integrated` + `validation_status` from `DumpOpTimings` |
-| Op **data** transferred to a client and validated there | **Not implemented** | By design: hints only (G2, G4) |
-| Direct Kitsune2 gossip integration (relay as a K2 module/peer) | **Not implemented** | G1, G5; see the migration path in `architecture.md` |
+| Lightweight conductor C, offline while A authored, catches up from B by native Kitsune2 gossip after an HTTP hint, and **validates the ops itself** | **Demonstrated** | `scripts/holochain-three-node-e2e.sh`. Every hinted op is integrated, `Accepted` and `locally_validated: true` in C's own `DumpOpTimings`; A is offline, so the data can only come from B. Control run without the relay's peer hint: no catch-up in 150 s. |
+| Event-driven notification (`OpsIntegrated`) | **Demonstrated with a patched conductor** (not released Holochain) | `MODE=event scripts/holochain-three-node-e2e.sh`; see `results.md` |
+| Missed notifications / relay restarts do not prevent eventual delivery | **Tested** | `crates/relay/tests/holochain_reconcile.rs` (scripted conductor) and the three-node event run (polling reconciles) |
+| Op **data** carried by the relay | **No, by design** | The relay carries hints; data moves by Kitsune2 between conductors |
+| Relay as a Kitsune2 module or peer | **Not implemented** | G5; not needed for the demonstrated path |

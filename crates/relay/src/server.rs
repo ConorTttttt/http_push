@@ -3,6 +3,7 @@
 use crate::api::{self, AppState, SharedState};
 use crate::ingest;
 use crate::journal::Journal;
+use crate::metrics::Metrics;
 use crate::mock::MockInjector;
 use crate::settings::RelaySettings;
 use axum::extract::State;
@@ -10,7 +11,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hc_push_source_api::{
-    now_ms, CancellationToken, ChangeSink, ChangeSource, HealthHandle, SourceContext,
+    now_ms, CancellationToken, ChangeSink, ChangeSource, DynPeerHints, HealthHandle, SourceContext,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -29,6 +30,8 @@ pub struct ServeOptions {
     /// Loopback-only operator listener (mock injection, stats).
     pub admin: Option<TcpListener>,
     pub mock: Option<MockInjector>,
+    /// Peer records of the relay's own conductor (`GET /v1/peers`).
+    pub peers: Option<DynPeerHints>,
     pub shutdown: CancellationToken,
 }
 
@@ -42,8 +45,10 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<()> {
         public,
         admin,
         mock,
+        peers,
         shutdown,
     } = opts;
+    let metrics = Arc::new(Metrics::new());
 
     let (live, _) = broadcast::channel(1024);
     let (batch_tx, batch_rx) = mpsc::channel(64);
@@ -79,6 +84,7 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<()> {
         settings.spaces.clone(),
         batch_rx,
         live.clone(),
+        metrics.clone(),
     ));
 
     // Periodic retention + subscription expiry.
@@ -116,6 +122,8 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<()> {
         live,
         source_infos,
         shutdown.clone(),
+        metrics,
+        peers,
     ));
 
     let public_addr = public.local_addr()?;
@@ -228,13 +236,50 @@ async fn admin_stats(State(st): State<AdminState>) -> Result<Json<serde_json::Va
         "events_retained": events,
         "subscriptions": subs,
         "sse_open": sse_open,
+        "metrics": st.app.metrics.snapshot(),
     })))
+}
+
+async fn admin_metrics(State(st): State<AdminState>) -> Result<String, StatusCode> {
+    let j = st.app.journal.clone();
+    let (bounds, events, subs) = tokio::task::spawn_blocking(move || {
+        Ok::<_, crate::journal::JournalError>((
+            j.bounds()?,
+            j.event_count()?,
+            j.subscription_count()?,
+        ))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let sse_open =
+        (st.app.settings.max_sse_connections - st.app.sse_slots.available_permits()) as f64;
+    Ok(st.app.metrics.prometheus(&[
+        (
+            "hcpush_journal_head_seq",
+            "Highest journal sequence",
+            bounds.head as f64,
+        ),
+        (
+            "hcpush_journal_pruned_through_seq",
+            "Events up to here were pruned",
+            bounds.pruned_through as f64,
+        ),
+        (
+            "hcpush_journal_events_retained",
+            "Events currently retained",
+            events as f64,
+        ),
+        ("hcpush_subscriptions", "Active subscriptions", subs as f64),
+        ("hcpush_sse_streams_open", "Open SSE streams", sse_open),
+    ]))
 }
 
 fn admin_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/v1/mock/changes", post(admin_inject))
         .route("/admin/v1/stats", get(admin_stats))
+        .route("/admin/v1/metrics", get(admin_metrics))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .with_state(state)
 }

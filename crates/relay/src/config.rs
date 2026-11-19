@@ -153,6 +153,17 @@ pub struct Cli {
     /// Forward digests of app signals.
     #[arg(long, env = "HC_PUSH_HC_SIGNALS", default_value_t = true, action = clap::ArgAction::Set)]
     pub hc_signals: bool,
+
+    /// Subscribe to the event-driven `OpsIntegrated` system signal when the
+    /// conductor supports it (requires the upstream patch in `upstream/` and a
+    /// relay built with `--features ops-integrated-signal`). Polling always
+    /// continues as the durable reconciliation path.
+    #[arg(long, env = "HC_PUSH_HC_OPS_INTEGRATED", default_value_t = true, action = clap::ArgAction::Set)]
+    pub hc_ops_integrated: bool,
+
+    /// Serve the conductor's own signed agent infos on `GET /v1/peers`.
+    #[arg(long, env = "HC_PUSH_HC_PEER_HINTS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub hc_peer_hints: bool,
 }
 
 impl Cli {

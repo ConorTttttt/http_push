@@ -46,6 +46,7 @@ retained, or an explicit `410` if it was pruned.
   "change_key": "1de9e922e110dacbdf87672f36031d45",
   "refs": [{ "type": "dht_op", "id": "uhCQkUmU0uwXh5FJRhmV45cGIeEI_r3eeQt149NlTBO9wmzkV5i_Y" }],
   "observed_at_ms": 1795050420681,
+  "occurred_at_ms": 1795050420310,
   "source": "holochain-op-timings"
 }
 ```
@@ -60,7 +61,8 @@ retained, or an explicit `410` if it was pruned.
 | `change_key` | See above |
 | `refs` | Opaque references: `dht_op` (DhtOpHash), `digest` (`sha256:<hex>` of a payload the relay does not forward), `mock` |
 | `observed_at_ms` | Relay clock, diagnostics only; never order by it |
-| `source` | Change source id (`holochain-op-timings`, `holochain-app-signals`, `mock`) |
+| `occurred_at_ms` | Optional. When the change happened at its origin, if the source reports it (Holochain sources: the conductor's integration time). Diagnostics and latency metrics only |
+| `source` | Change source id: `holochain-op-timings` (polling), `holochain-ops-integrated` (event-driven, patched conductor), `holochain-app-signals`, `mock` |
 
 Envelopes never contain DHT payloads, entry content, agent keys or signal
 payloads.
@@ -79,7 +81,8 @@ only.
 Protocol versions, `relay_id`, `journal_id`, served `spaces` (unless
 `HC_PUSH_ADVERTISE_SPACES=false`), `sources` with **`fidelity`** (`mock`,
 `conductor_op_level`, `conductor_app_signal`), retention limits, request
-limits, transports (`["sse","sync"]`) and registration mode (`key`|`open`).
+limits, transports (`["sse","sync"]`), `peer_hints` (whether `GET
+/v1/peers` is available) and registration mode (`key`|`open`).
 Clients use it to judge coverage. Different relays may serve different
 spaces and have different retention.
 
@@ -150,6 +153,24 @@ automatically by reconnecting `EventSource`s), else `?cursor=`, else "now".
 * Proxies must not buffer: the relay sends `X-Accel-Buffering: no` and the
   Caddy config uses `flush_interval -1`.
 
+### `GET /v1/peers?space=<dna>`
+
+Bearer subscription token; `space` must be one of the subscription's spaces
+(`403` otherwise). Returns the signed Kitsune2 peer records
+(`AgentInfoSigned` JSON strings) of the relay's **own** conductor for that
+space:
+
+```json
+{ "space": "uhC0k…", "agent_infos": ["{\"agentInfo\":\"…\",\"signature\":\"…\"}"] }
+```
+
+The client passes them to its own conductor (Holochain `AddAgentInfo`, or
+`hc client call add-agents '[…]'`), which verifies the signatures. Its
+conductor can then gossip directly with this always-on peer. The relay is
+not a peer directory: it never returns other agents' records. `404` if the
+relay has no peer-hint provider (mock source); `503` if the conductor is
+unavailable.
+
 ## Errors
 
 ```json
@@ -179,6 +200,18 @@ on wake / reconnect / timer:
 ```
 
 `seen` is a bounded FIFO (default 10 000 keys), persisted with the cursors.
+
+Catch-up of an on-device conductor (verified in
+`scripts/holochain-three-node-e2e.sh`):
+
+```
+hints = sync()                              # op hashes the device is missing
+if hints: peers = GET /v1/peers?space=…     # relay's own conductor, signed
+          start conductor; AddAgentInfo(peers)
+          wait until DumpOpTimings shows every hinted op integrated
+          (Kitsune2 gossip + fetch + the device's own validation)
+          stop conductor -> idle
+```
 
 ## Versioning
 

@@ -66,6 +66,11 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     page_size: u32,
 
+    /// Append one JSON line of metrics per command (duration, HTTP bytes,
+    /// latency) to this file.
+    #[arg(long, env = "HC_PUSH_CLIENT_METRICS_OUT")]
+    metrics_out: Option<PathBuf>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -104,6 +109,36 @@ enum Cmd {
         #[arg(long)]
         relay: String,
     },
+    /// Print the relay conductor's signed peer records for a space as a JSON
+    /// array, the format `hc client call add-agents` and Holochain's
+    /// `AddAgentInfo` accept.
+    Peers {
+        /// Relay name (default: first configured).
+        #[arg(long)]
+        relay: Option<String>,
+        /// Space (default: first configured).
+        #[arg(long = "for-space")]
+        for_space: Option<String>,
+    },
+}
+
+fn write_metrics(path: &Option<PathBuf>, v: serde_json::Value) -> anyhow::Result<()> {
+    if let Some(p) = path {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)?;
+        writeln!(f, "{v}")?;
+    }
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn print_event(e: &EventEnvelope) -> anyhow::Result<()> {
@@ -207,11 +242,33 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             eprintln!(
-                "sync done: delivered={} duplicates={} served_by={}",
+                "sync done: delivered={} duplicates={} served_by={} duration_ms={} http_requests={} bytes_sent={} bytes_received={}",
                 report.delivered,
                 report.duplicates,
-                report.served_by.as_deref().unwrap_or("NONE")
+                report.served_by.as_deref().unwrap_or("NONE"),
+                report.duration_ms,
+                report.transfer.requests,
+                report.transfer.bytes_sent,
+                report.transfer.bytes_received,
             );
+            write_metrics(
+                &cli.metrics_out,
+                serde_json::json!({
+                    "cmd": "sync",
+                    "at_ms": now_ms(),
+                    "duration_ms": report.duration_ms,
+                    "delivered": report.delivered,
+                    "duplicates": report.duplicates,
+                    "gaps": report.gaps.len(),
+                    "served_by": report.served_by,
+                    "transfer": report.transfer,
+                    "latency": report.latency,
+                    "relays": report.outcomes.iter().map(|o| match &o.result {
+                        Ok(s) => serde_json::json!({"relay": o.relay, "ok": true, "pages": s.pages, "received": s.received, "delivered": s.delivered, "duplicates": s.duplicates}),
+                        Err(e) => serde_json::json!({"relay": o.relay, "ok": false, "error": e.to_string()}),
+                    }).collect::<Vec<_>>(),
+                }),
+            )?;
             if !report.any_success() {
                 anyhow::bail!("no relay could be synced");
             }
@@ -234,9 +291,26 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             eprintln!(
-                "listen ended: {:?} delivered={} duplicates={}",
-                out.end, out.delivered, out.duplicates
+                "listen ended: {:?} delivered={} duplicates={} duration_ms={} bytes_received={}",
+                out.end,
+                out.delivered,
+                out.duplicates,
+                out.duration_ms,
+                out.transfer.bytes_received
             );
+            write_metrics(
+                &cli.metrics_out,
+                serde_json::json!({
+                    "cmd": "listen",
+                    "at_ms": now_ms(),
+                    "end": format!("{:?}", out.end),
+                    "duration_ms": out.duration_ms,
+                    "delivered": out.delivered,
+                    "duplicates": out.duplicates,
+                    "transfer": out.transfer,
+                    "latency": out.latency,
+                }),
+            )?;
         }
         Cmd::Status => {
             for (name, rs) in &client.state().relays {
@@ -253,6 +327,29 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             eprintln!("dedup set: {} change keys", client.state().seen.len());
+        }
+        Cmd::Peers { relay, for_space } => {
+            let relay = relay.unwrap_or(first);
+            let space = for_space.unwrap_or_else(|| cli.spaces[0].clone());
+            let before = client.transfer_totals();
+            let infos = client.peer_hints(&relay, &space).await?;
+            // Each entry is an encoded AgentInfoSigned JSON object.
+            println!("[{}]", infos.join(","));
+            eprintln!("{} peer record(s) from {relay}", infos.len());
+            let t = client.transfer_totals();
+            write_metrics(
+                &cli.metrics_out,
+                serde_json::json!({
+                    "cmd": "peers",
+                    "at_ms": now_ms(),
+                    "count": infos.len(),
+                    "transfer": {
+                        "requests": t.requests - before.requests,
+                        "bytes_sent": t.bytes_sent - before.bytes_sent,
+                        "bytes_received": t.bytes_received - before.bytes_received,
+                    },
+                }),
+            )?;
         }
         Cmd::Unsubscribe { relay } => {
             client.unsubscribe(&relay).await?;

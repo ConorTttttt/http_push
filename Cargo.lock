@@ -1206,6 +1206,7 @@ name = "hc_push_holochain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "futures",
  "hc_push_protocol",
  "hc_push_source_api",
@@ -1213,6 +1214,7 @@ dependencies = [
  "holochain_client",
  "holochain_conductor_api",
  "holochain_types",
+ "kitsune2_api",
  "serde",
  "serde_json",
  "sha2",
@@ -1239,6 +1241,7 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "futures",
  "hc_push_client",
@@ -1246,6 +1249,7 @@ dependencies = [
  "hc_push_protocol",
  "hc_push_source_api",
  "hex",
+ "http-body",
  "rand 0.8.8",
  "reqwest",
  "rusqlite",

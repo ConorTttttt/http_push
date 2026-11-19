@@ -3,7 +3,7 @@ use clap::Parser;
 use hc_push_relay::config::{Cli, LogFormat, SourceKind};
 use hc_push_relay::mock::{mock_source, MockInjector};
 use hc_push_relay::{serve, Journal, ServeOptions};
-use hc_push_source_api::{CancellationToken, ChangeSource};
+use hc_push_source_api::{CancellationToken, ChangeSource, DynPeerHints};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -86,17 +86,23 @@ async fn run() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     tokio::spawn(shutdown_signal(shutdown.clone()));
 
-    let (sources, spaces, mock): (
-        Vec<Box<dyn ChangeSource>>,
-        Vec<String>,
-        Option<MockInjector>,
-    ) = match cli.source {
+    let Built {
+        sources,
+        spaces,
+        mock,
+        peers,
+    } = match cli.source {
         SourceKind::Mock => {
             let interval =
                 (cli.mock_interval_ms > 0).then(|| Duration::from_millis(cli.mock_interval_ms));
             let (src, inj) = mock_source(cli.spaces.clone(), interval);
             tracing::warn!("running with the MOCK change source: events are synthetic");
-            (vec![Box::new(src)], cli.spaces.clone(), Some(inj))
+            Built {
+                sources: vec![Box::new(src)],
+                spaces: cli.spaces.clone(),
+                mock: Some(inj),
+                peers: None,
+            }
         }
         SourceKind::Holochain => build_holochain(&cli, &shutdown).await?,
     };
@@ -133,20 +139,22 @@ async fn run() -> anyhow::Result<()> {
         public,
         admin,
         mock,
+        peers,
         shutdown,
     })
     .await
 }
 
+/// Sources and capabilities selected by the configuration.
+struct Built {
+    sources: Vec<Box<dyn ChangeSource>>,
+    spaces: Vec<String>,
+    mock: Option<MockInjector>,
+    peers: Option<DynPeerHints>,
+}
+
 #[cfg(feature = "holochain")]
-async fn build_holochain(
-    cli: &Cli,
-    shutdown: &CancellationToken,
-) -> anyhow::Result<(
-    Vec<Box<dyn ChangeSource>>,
-    Vec<String>,
-    Option<MockInjector>,
-)> {
+async fn build_holochain(cli: &Cli, shutdown: &CancellationToken) -> anyhow::Result<Built> {
     use hc_push_holochain::{discover, HolochainConfig};
     let cfg = HolochainConfig {
         admin_addr: cli.hc_admin_addr.clone(),
@@ -156,23 +164,23 @@ async fn build_holochain(
         page_limit: cli.hc_page_limit.clamp(1, 5000),
         op_timings: cli.hc_op_timings,
         signals: cli.hc_signals,
+        ops_integrated: cli.hc_ops_integrated,
+        peer_hints: cli.hc_peer_hints,
     };
     let built = discover(cfg, shutdown.clone()).await?;
     let mut spaces = built.spaces;
     if !cli.spaces.is_empty() {
         spaces.retain(|s| cli.spaces.contains(s));
     }
-    Ok((built.sources, spaces, None))
+    Ok(Built {
+        sources: built.sources,
+        spaces,
+        mock: None,
+        peers: built.peers,
+    })
 }
 
 #[cfg(not(feature = "holochain"))]
-async fn build_holochain(
-    _cli: &Cli,
-    _shutdown: &CancellationToken,
-) -> anyhow::Result<(
-    Vec<Box<dyn ChangeSource>>,
-    Vec<String>,
-    Option<MockInjector>,
-)> {
+async fn build_holochain(_cli: &Cli, _shutdown: &CancellationToken) -> anyhow::Result<Built> {
     anyhow::bail!("this binary was built without the `holochain` feature")
 }

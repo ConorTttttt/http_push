@@ -3,7 +3,7 @@
 use hc_push_relay::auth::RegistrationKeys;
 use hc_push_relay::mock::{mock_source, MockInjector};
 use hc_push_relay::{serve, Journal, RelaySettings, ServeOptions};
-use hc_push_source_api::CancellationToken;
+use hc_push_source_api::{CancellationToken, ChangeSource, DynPeerHints};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -29,6 +29,28 @@ impl TestRelay {
     }
 
     pub async fn start_with(path: Option<&Path>, f: impl FnOnce(&mut RelaySettings)) -> Self {
+        Self::start_custom(path, f, Vec::new(), None).await
+    }
+
+    /// Start with the mock source plus `extra` sources and optional peer hints.
+    pub async fn start_custom(
+        path: Option<&Path>,
+        f: impl FnOnce(&mut RelaySettings),
+        extra: Vec<Box<dyn ChangeSource>>,
+        peers: Option<DynPeerHints>,
+    ) -> Self {
+        Self::start_custom_at("127.0.0.1:0", path, f, extra, peers).await
+    }
+
+    /// Like [`Self::start_custom`] but on a given public address, so a test
+    /// can restart a relay where its clients expect it.
+    pub async fn start_custom_at(
+        bind: &str,
+        path: Option<&Path>,
+        f: impl FnOnce(&mut RelaySettings),
+        extra: Vec<Box<dyn ChangeSource>>,
+        peers: Option<DynPeerHints>,
+    ) -> Self {
         let mut settings = RelaySettings {
             spaces: vec![SPACE.to_string(), OTHER_SPACE.to_string()],
             registration_keys: RegistrationKeys::new([KEY]),
@@ -44,7 +66,7 @@ impl TestRelay {
             None => Journal::open_in_memory(settings.retention).unwrap(),
         });
         let (src, mock) = mock_source(settings.spaces.clone(), None);
-        let public = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public = tokio::net::TcpListener::bind(bind).await.unwrap();
         let admin_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = public.local_addr().unwrap();
         let admin = admin_l.local_addr().unwrap();
@@ -53,10 +75,13 @@ impl TestRelay {
             settings,
             journal: journal.clone(),
             relay_id: None,
-            sources: vec![Box::new(src)],
+            sources: std::iter::once(Box::new(src) as Box<dyn ChangeSource>)
+                .chain(extra)
+                .collect(),
             public,
             admin: Some(admin_l),
             mock: Some(mock.clone()),
+            peers,
             shutdown: shutdown.clone(),
         }));
         let url = format!("http://{addr}");

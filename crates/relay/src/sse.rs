@@ -16,6 +16,7 @@ use futures::Stream;
 use hc_push_protocol::{
     EventEnvelope, SyncRequired, SyncRequiredReason, SSE_EVENT_CHANGE, SSE_EVENT_SYNC_REQUIRED,
 };
+use hc_push_source_api::now_ms;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -131,6 +132,7 @@ pub async fn events(
                 return;
             }
             for env in &r.events {
+                st.metrics.record_sse_sent(env.observed_at_ms, now_ms());
                 yield Ok(change_event(env));
             }
         }
@@ -148,6 +150,7 @@ pub async fn events(
                             }
                             last_seq = env.seq();
                             if spaces.contains(&env.space) {
+                                st.metrics.record_sse_sent(env.observed_at_ms, now_ms());
                                 yield Ok(change_event(env));
                             }
                         }

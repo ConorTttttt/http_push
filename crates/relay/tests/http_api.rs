@@ -597,3 +597,173 @@ async fn cursors_are_not_interchangeable_between_relays() {
     a.stop().await;
     b.stop().await;
 }
+
+struct StaticPeers;
+
+impl hc_push_source_api::PeerHints for StaticPeers {
+    fn peer_hints(
+        &self,
+        space: &str,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<String>>> {
+        let s = space.to_string();
+        Box::pin(async move {
+            Ok(vec![format!(
+                "{{\"agentInfo\":\"for {s}\",\"signature\":\"AA\"}}"
+            )])
+        })
+    }
+}
+
+#[tokio::test]
+async fn peers_endpoint_is_scoped_to_the_subscription() {
+    let r = TestRelay::start_custom(
+        None,
+        |_| {},
+        Vec::new(),
+        Some(std::sync::Arc::new(StaticPeers) as hc_push_source_api::DynPeerHints),
+    )
+    .await;
+    let http = reqwest::Client::new();
+    let caps: Capabilities = http
+        .get(format!("{}/v1/capabilities", r.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(caps.peer_hints);
+    let sub = subscribe(&http, &r.url, &[SPACE]).await;
+    let get = |token: Option<String>, space: &str| {
+        let mut req = http
+            .get(format!("{}/v1/peers", r.url))
+            .query(&[("space", space)]);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req.send()
+    };
+    assert_eq!(get(None, SPACE).await.unwrap().status(), 401);
+    let resp = get(Some(sub.token.clone()), SPACE).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: hc_push_protocol::PeersResponse = resp.json().await.unwrap();
+    assert_eq!(body.space, SPACE);
+    assert_eq!(body.agent_infos.len(), 1);
+    // A space the subscription does not cover.
+    assert_eq!(
+        get(Some(sub.token.clone()), OTHER_SPACE)
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    r.stop().await;
+
+    // A relay without a peer-hint provider says so.
+    let r = TestRelay::start(None).await;
+    let sub = subscribe(&http, &r.url, &[SPACE]).await;
+    let resp = http
+        .get(format!("{}/v1/peers", r.url))
+        .query(&[("space", SPACE)])
+        .bearer_auth(&sub.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    r.stop().await;
+}
+
+fn metric(text: &str, name_and_labels: &str) -> f64 {
+    text.lines()
+        .find(|l| l.starts_with(name_and_labels) && l[name_and_labels.len()..].starts_with(' '))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("metric {name_and_labels} not found in:\n{text}"))
+}
+
+#[tokio::test]
+async fn admin_metrics_count_traffic_and_events() {
+    let r = TestRelay::start(None).await;
+    let http = reqwest::Client::new();
+    let sub = subscribe(&http, &r.url, &[SPACE]).await;
+    // One live SSE event, then a sync page.
+    let resp = http
+        .get(format!("{}/v1/events", r.url))
+        .bearer_auth(&sub.token)
+        .send()
+        .await
+        .unwrap();
+    let mock = r.mock.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        mock.inject(SPACE, &["m1".to_string()]).await.unwrap();
+    });
+    read_sse_events(resp, 1, Duration::from_secs(5)).await;
+    let page = sync_page(&http, &r.url, &sub.token, Some(&sub.cursor.to_string()), 10).await;
+    let body = page.bytes().await.unwrap();
+    // Duplicates are counted.
+    r.inject(SPACE, &["m1"]).await;
+
+    let text = http
+        .get(format!("http://{}/admin/v1/metrics", r.admin))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        metric(
+            &text,
+            "hcpush_http_requests_total{route=\"/v1/sync\",status=\"200\"}"
+        ),
+        1.0
+    );
+    assert_eq!(
+        metric(
+            &text,
+            "hcpush_http_requests_total{route=\"/v1/subscriptions\",status=\"201\"}"
+        ),
+        1.0
+    );
+    assert!(
+        metric(
+            &text,
+            "hcpush_http_response_body_bytes_total{route=\"/v1/sync\"}"
+        ) >= body.len() as f64
+    );
+    assert!(
+        metric(
+            &text,
+            "hcpush_http_response_body_bytes_total{route=\"/v1/events\"}"
+        ) > 0.0
+    );
+    assert_eq!(metric(&text, "hcpush_sse_events_sent_total"), 1.0);
+    assert_eq!(metric(&text, "hcpush_sync_events_served_total"), 1.0);
+    assert_eq!(
+        metric(
+            &text,
+            "hcpush_events_journaled_total{source=\"mock\",kind=\"mock_change\"}"
+        ),
+        1.0
+    );
+    assert_eq!(
+        metric(&text, "hcpush_duplicates_dropped_total{source=\"mock\"}"),
+        1.0
+    );
+    assert_eq!(metric(&text, "hcpush_journal_head_seq"), 1.0);
+    assert_eq!(
+        metric(&text, "hcpush_sse_dispatch_latency_seconds_count"),
+        1.0
+    );
+    // Not exposed publicly.
+    assert_eq!(
+        http.get(format!("{}/admin/v1/metrics", r.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    r.stop().await;
+}

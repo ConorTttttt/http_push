@@ -7,8 +7,10 @@ exist** and **catch up after being offline**, using short HTTP exchanges
 instead of continuous peer-to-peer connections. Independently operated
 HoloPorts or EdgeNodes provide the service.
 
-Non-goals for this milestone: transferring DHT op *data* to clients,
-replacing Kitsune2 gossip, and a global relay registry.
+Non-goals: transferring DHT op *data* through the relay, replacing
+Kitsune2 gossip, and a global relay registry. Op data reaches a device only
+through its own conductor (Kitsune2 gossip with the HoloPort, validated by
+the device itself); the relay tells it *what* is missing and *whom* to ask.
 
 ## Components
 
@@ -18,14 +20,14 @@ replacing Kitsune2 gossip, and a global relay registry.
  ┌───────────────────────▼──────────────────────────────── HoloPort / EdgeNode
  │  Holochain conductor ── validation ── integration ── DHT store            │
  │      │ admin ws (loopback only, used briefly to issue an app token)        │
- │      │ app ws (loopback): DumpOpTimings · on_signal                       │
+ │      │ app ws (loopback): DumpOpTimings · on_signal · AgentInfo           │
  │  ┌───▼──────────────────────────── hc-push-relay ─────────────────────┐   │
  │  │ ChangeSource(s)  ──▶ ingest ──▶ SQLite journal ──▶ broadcast        │   │
- │  │  · OpTimingsSource  (holochain-adapter)      │            │         │   │
- │  │  · AppSignalSource  (holochain-adapter)      │            │         │   │
- │  │  · MockSource       (dev/test)               ▼            ▼         │   │
- │  │                         GET /v1/sync (durable)   GET /v1/events     │   │
- │  │                         POST /v1/subscriptions   (SSE, foreground)  │   │
+ │  │  · OpTimingsSource     polling, durable  │            │              │   │
+ │  │  · OpsIntegratedSource event (patched)   │            │              │   │
+ │  │  · AppSignalSource     app signals       ▼            ▼              │   │
+ │  │  · MockSource (dev)    GET /v1/sync (durable)   GET /v1/events (SSE) │   │
+ │  │  ConductorPeers ─────▶ GET /v1/peers   POST /v1/subscriptions       │   │
  │  └────────────────────────────────┬────────────────────────────────────┘   │
  └───────────────────────────────────┼─────────────────────────────────────────┘
                      Caddy / TLS ────┘
@@ -35,7 +37,11 @@ replacing Kitsune2 gossip, and a global relay registry.
    relay A (HoloPort)             relay B (EdgeNode)       … any number
           ▲                              ▲
           └──── hc-push-client (phone): per-relay cursor, cross-relay dedup,
-                failover, gap notices → app → own conductor validates data
+                failover, gap notices → app
+                       │ hints = missing op hashes; peers = HoloPort's signed record
+                       ▼
+                phone's own conductor ── AddAgentInfo(peers) ── Kitsune2 gossip
+                with the HoloPort ── fetch ── own validation ── integrated
 ```
 
 | Crate | Role |
@@ -69,6 +75,18 @@ replacing Kitsune2 gossip, and a global relay registry.
   larger than the replay limit, and lagging consumers, get `sync_required`
   instead of an unbounded replay.
 * **Maintenance.** Every 60 s: apply retention, expire idle subscriptions.
+* **Metrics** (`metrics.rs`, loopback admin listener only:
+  `/admin/v1/metrics` Prometheus, `/admin/v1/stats` JSON):
+  * per-source detection latency (`observed_at - occurred_at`);
+  * SSE dispatch latency;
+  * events journaled and duplicates dropped per source;
+  * HTTP requests per route and status;
+  * response body bytes per route, including streamed SSE;
+  * estimated header bytes, request body bytes;
+  * journal and subscription gauges.
+
+  The client reports its own side: duration, HTTP bytes, and relay→app and
+  origin→app latency per `sync`/`listen`.
 * **Shutdown.** On SIGTERM/SIGINT the relay stops accepting, sends
   `sync_required:shutdown` to open streams, stops sources, drains pending
   batches (10 s bound) and exits. State is already durable per batch.
@@ -84,6 +102,19 @@ replacing Kitsune2 gossip, and a global relay registry.
   by the journal. If the ops behind a pending op exceed one poll's budget
   (10 pages) or 20 000 ops, the cursor advances past the pending op with a
   warning, so scanning never stalls; that op is then not re-checked.
+* `OpsIntegratedSource` (feature `ops-integrated-signal`, conductor with
+  the upstream patch U1 in `upstream-changes.md`) sends
+  `SubscribeOpsIntegrated` on its own app connection and journals each
+  `SystemSignal::OpsIntegrated` immediately, without a checkpoint. It is
+  the latency path; the poller keeps running (e.g. every 15–30 s) and
+  reconciles anything the signal path missed (relay down, connection lag,
+  ops integrated before the subscription). Both paths produce the same
+  `change_key`, so the journal keeps whichever arrives first. `discover()`
+  probes support and falls back to polling only.
+* `ConductorPeers` answers `GET /v1/peers` with the conductor's own signed
+  agent infos (`AppRequest::AgentInfo`, filtered to the app's agent). It is
+  a peer *hint*, not a directory: the relay never hands out other agents'
+  records.
 * `AppSignalSource` subscribes with `on_signal` and forwards a
   `sha256:` digest of each `Signal::App` / `Signal::AppDirect` payload
   (local events only, see `holochain-integration.md` §2). It checks
@@ -161,21 +192,30 @@ remains the source of truth.
 
 ## Migration path to genuine Kitsune2 synchronization
 
-1. **Today:** observe the conductor's integrated ops through the app API
-   (polling, hints only).
-2. **Small additive Holochain changes** (gaps G1/G2 in
-   `holochain-integration.md`):
-   * push-style `OpsIntegrated` signal → replaces polling inside
-     `OpTimingsSource`;
-   * op basis and type in `OpTimingDump` → actionable refs for clients.
+1. **Done:** observe the conductor's integrated ops through the app API
+   (polling, durable), and let a device's conductor catch up by **native
+   Kitsune2 gossip with the HoloPort**: the relay supplies the missing op
+   hashes (completion criterion) and the HoloPort's signed peer record.
+   Verified with three conductors (`docs/results.md`).
+2. **Small additive Holochain changes** (`upstream-changes.md`):
+   * U1 `OpsIntegrated` signal: implemented as a patch against 0.7.1 and
+     wired into the relay (`OpsIntegratedSource`); polling stays as the
+     reconciliation path;
+   * U2/U3 "gossip with this peer now" and better stale-peer handling: the
+     dominant cost of catch-up today;
+   * U5 basis and type in `OpTimingDump` → arc-filterable hints.
 
-   No protocol change is needed.
-3. **Kitsune2-native data path.** The phone runs a small/zero-arc conductor.
-   A Kitsune2 transport module over HTTP (request/response plus SSE for
-   inbound frames) lets it run bounded fetch/gossip rounds with a relay
-   acting as an always-on K2 peer. Ops then enter the phone through
-   `OpStore::process_incoming_ops` and Holochain's normal validation. The
-   relay journal becomes a K2-aware index: per-arc cursors mapped onto
-   `retrieve_op_ids_bounded` and slice hashes for region reconciliation.
+   No relay protocol change is needed for any of these.
+3. **Only if networking stays too costly on devices.** Step 1 already uses
+   Kitsune2's own gossip and the device's own validation; it pays for a
+   short-lived Kitsune2 session (iroh transport) per catch-up. If that turns
+   out too expensive, a Kitsune2 transport module over HTTP
+   (request/response plus SSE for inbound frames) could carry the same
+   bounded fetch/gossip rounds with the HoloPort as an always-on K2 peer.
+   Ops would still enter the device through `OpStore::process_incoming_ops`
+   and Holochain's normal validation. The relay journal would become a
+   K2-aware index: per-arc cursors mapped onto `retrieve_op_ids_bounded`
+   and slice hashes for region reconciliation. Not started; measure step 1
+   on real devices first.
 4. **Discovery and incentives**, as listed under Decentralization and in the
    README's future-work section.

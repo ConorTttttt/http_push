@@ -1,6 +1,7 @@
 //! Ingest loop: change sources -> journal -> live broadcast.
 
 use crate::journal::Journal;
+use crate::metrics::Metrics;
 use hc_push_protocol::{is_valid_ref_id, is_valid_space_id, EventEnvelope};
 use hc_push_source_api::{now_ms, ChangeBatch, ObservedChange};
 use std::collections::HashSet;
@@ -26,6 +27,7 @@ pub async fn run(
     served_spaces: Vec<String>,
     mut rx: mpsc::Receiver<ChangeBatch>,
     live: broadcast::Sender<Arc<Vec<EventEnvelope>>>,
+    metrics: Arc<Metrics>,
 ) {
     let spaces: HashSet<String> = served_spaces.into_iter().collect();
     while let Some(batch) = rx.recv().await {
@@ -42,6 +44,7 @@ pub async fn run(
         if !invalid.is_empty() {
             tracing::warn!(source = %batch.source_id, dropped = invalid.len(), "dropping malformed or out-of-scope changes");
         }
+        let valid_count = valid.len();
         let j = journal.clone();
         let source_id = batch.source_id.clone();
         let checkpoint = batch.checkpoint.clone();
@@ -52,6 +55,7 @@ pub async fn run(
         match res {
             Ok(Ok(envs)) => {
                 let n = envs.len();
+                metrics.record_journaled(&batch.source_id, &envs, valid_count - n);
                 if n > 0 {
                     tracing::debug!(source = %batch.source_id, new = n, head = envs.last().map(|e| e.seq()), "journaled changes");
                     // No receivers is fine: nobody is listening right now.

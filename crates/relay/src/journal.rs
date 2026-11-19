@@ -19,7 +19,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 1;
+/// v2 adds `events.occurred_at_ms` (v1 journals are migrated in place).
+const SCHEMA_VERSION: i64 = 2;
 
 /// Retention policy.
 #[derive(Debug, Clone, Copy)]
@@ -133,7 +134,8 @@ impl Journal {
                 kind           TEXT NOT NULL,
                 refs           TEXT NOT NULL,
                 source         TEXT NOT NULL,
-                observed_at_ms INTEGER NOT NULL
+                observed_at_ms INTEGER NOT NULL,
+                occurred_at_ms INTEGER
             );
             CREATE INDEX IF NOT EXISTS events_space_seq ON events(space, seq);
             CREATE INDEX IF NOT EXISTS events_observed ON events(observed_at_ms);
@@ -167,6 +169,15 @@ impl Journal {
         match get(&conn, "schema_version")? {
             None => put(&conn, "schema_version", &SCHEMA_VERSION.to_string())?,
             Some(v) if v == SCHEMA_VERSION.to_string() => {}
+            Some(v) if v == "1" => {
+                // v1 -> v2: nullable column, existing rows keep NULL.
+                conn.execute_batch(
+                    "BEGIN;
+                     ALTER TABLE events ADD COLUMN occurred_at_ms INTEGER;
+                     UPDATE meta SET value = '2' WHERE key = 'schema_version';
+                     COMMIT;",
+                )?;
+            }
             Some(v) => {
                 return Err(JournalError::Db(rusqlite::Error::InvalidParameterName(
                     format!("unsupported journal schema version {v}"),
@@ -248,8 +259,8 @@ impl Journal {
             // still advances the AUTOINCREMENT counter, leaving gaps.
             let mut exists = tx.prepare_cached("SELECT 1 FROM events WHERE change_key = ?1")?;
             let mut insert = tx.prepare_cached(
-                "INSERT INTO events(change_key, space, kind, refs, source, observed_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events(change_key, space, kind, refs, source, observed_at_ms, occurred_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for c in changes {
                 let key = change_key(&c.space, c.kind, &c.refs);
@@ -263,7 +274,8 @@ impl Journal {
                     c.kind.as_str(),
                     refs,
                     source_id,
-                    now_ms as i64
+                    now_ms as i64,
+                    c.occurred_at_ms.map(|t| t as i64)
                 ])?;
                 if n == 1 {
                     let seq = tx.last_insert_rowid() as u64;
@@ -273,7 +285,7 @@ impl Journal {
                         c.space.clone(),
                         c.kind,
                         c.refs.clone(),
-                        now_ms,
+                        (now_ms, c.occurred_at_ms),
                         source_id.to_string(),
                     ));
                 }
@@ -298,7 +310,7 @@ impl Journal {
         space: String,
         kind: ChangeKind,
         refs: Vec<ChangeRef>,
-        observed_at_ms: u64,
+        (observed_at_ms, occurred_at_ms): (u64, Option<u64>),
         source: String,
     ) -> EventEnvelope {
         EventEnvelope {
@@ -310,6 +322,7 @@ impl Journal {
             change_key,
             refs,
             observed_at_ms,
+            occurred_at_ms,
             source,
         }
     }
@@ -341,7 +354,7 @@ impl Journal {
         }
         let spaces_json = serde_json::to_string(spaces)?;
         let mut stmt = conn.prepare_cached(
-            "SELECT seq, change_key, space, kind, refs, source, observed_at_ms FROM events
+            "SELECT seq, change_key, space, kind, refs, source, observed_at_ms, occurred_at_ms FROM events
              WHERE seq > ?1 AND space IN (SELECT value FROM json_each(?2))
              ORDER BY seq ASC LIMIT ?3",
         )?;
@@ -356,12 +369,13 @@ impl Journal {
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, i64>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
                 ))
             },
         )?;
         let mut events = Vec::new();
         for row in rows {
-            let (seq, key, space, kind, refs, source, observed) = row?;
+            let (seq, key, space, kind, refs, source, observed, occurred) = row?;
             let refs: Vec<ChangeRef> = serde_json::from_str(&refs)?;
             events.push(self.envelope(
                 seq as u64,
@@ -369,7 +383,7 @@ impl Journal {
                 space,
                 kind.parse().unwrap_or(ChangeKind::Unknown),
                 refs,
-                observed.max(0) as u64,
+                (observed.max(0) as u64, occurred.map(|t| t.max(0) as u64)),
                 source,
             ));
         }
@@ -525,6 +539,7 @@ mod tests {
             space: space.into(),
             kind: ChangeKind::MockChange,
             refs: vec![ChangeRef::new(RefType::Mock, id)],
+            occurred_at_ms: None,
         }
     }
 
@@ -673,6 +688,40 @@ mod tests {
         assert_eq!(sub.label.as_deref(), Some("phone"));
         let e = j.append("m", &[change("s", "c")], None, 2).unwrap();
         assert_eq!(e[0].seq(), 3);
+    }
+
+    #[test]
+    fn migrates_v1_journal_and_keeps_occurred_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.sqlite3");
+        {
+            // A journal as created by schema v1.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, change_key TEXT NOT NULL UNIQUE,
+                    space TEXT NOT NULL, kind TEXT NOT NULL, refs TEXT NOT NULL,
+                    source TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
+                 INSERT INTO meta VALUES ('schema_version','1'),('journal_id','abcd'),
+                    ('relay_id','r'),('pruned_through','0');
+                 INSERT INTO events(change_key, space, kind, refs, source, observed_at_ms)
+                    VALUES ('k1','s','mock_change','[{\"type\":\"mock\",\"id\":\"old\"}]','mock',5);",
+            )
+            .unwrap();
+        }
+        let j = Journal::open(&path, Retention::default()).unwrap();
+        assert_eq!(j.journal_id(), "abcd");
+        let mut c = change("s", "new");
+        c.occurred_at_ms = Some(42);
+        j.append("m", &[c], None, 50).unwrap();
+        let r = j.read_after(0, &spaces(&["s"]), 10).unwrap();
+        assert_eq!(r.events.len(), 2);
+        assert_eq!(r.events[0].occurred_at_ms, None);
+        assert_eq!(r.events[1].occurred_at_ms, Some(42));
+        drop(j);
+        // Reopening a migrated journal is a no-op.
+        Journal::open(&path, Retention::default()).unwrap();
     }
 
     #[test]

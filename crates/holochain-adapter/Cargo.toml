@@ -12,6 +12,7 @@ futures.workspace = true
 hc_push_protocol.workspace = true
 hc_push_source_api.workspace = true
 hex.workspace = true
+kitsune2_api = "0.5"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -22,3 +23,12 @@ tracing.workspace = true
 holochain_client = { version = "=0.9.1", default-features = false }
 holochain_conductor_api = "=0.7.1"
 holochain_types = "=0.7.1"
+
+[features]
+# Event-driven `SystemSignal::OpsIntegrated`. Only compiles against the
+# patched Holochain crates (upstream/holochain-0.7.1-ops-integrated.patch);
+# see scripts/build-patched-holochain.sh.
+ops-integrated-signal = []
+
+[dev-dependencies]
+base64.workspace = true

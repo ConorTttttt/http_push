@@ -1,0 +1,640 @@
+diff --git a/crates/client/src/app_websocket.rs b/crates/client/src/app_websocket.rs
+index 2b4bed2..67894f7 100644
+--- a/crates/client/src/app_websocket.rs
++++ b/crates/client/src/app_websocket.rs
+@@ -463,6 +463,17 @@ impl AppWebsocket {
+         }
+     }
+ 
++    /// Opt this connection in to `SystemSignal::OpsIntegrated` signals for the DNAs of this
++    /// app. They then arrive through [`AppWebsocket::on_signal`]. Best effort: reconcile with
++    /// [`AppWebsocket::dump_op_timings`].
++    pub async fn subscribe_ops_integrated(&self) -> ConductorApiResult<()> {
++        let response = self.inner.send(AppRequest::SubscribeOpsIntegrated).await?;
++        match response {
++            AppResponse::Ok => Ok(()),
++            _ => unreachable!("Unexpected response {:?}", response),
++        }
++    }
++
+     /// Dump one page of DHT-op lifecycle timings for a DNA of this app.
+     ///
+     /// # Errors
+diff --git a/crates/holochain/src/conductor/api/api_external/app_interface.rs b/crates/holochain/src/conductor/api/api_external/app_interface.rs
+index 92b8b23..911e1d5 100644
+--- a/crates/holochain/src/conductor/api/api_external/app_interface.rs
++++ b/crates/holochain/src/conductor/api/api_external/app_interface.rs
+@@ -211,6 +211,12 @@ impl AppInterfaceApi {
+                     .await?;
+                 Ok(AppResponse::Ok)
+             }
++            AppRequest::SubscribeOpsIntegrated => {
++                // The subscription is per connection and is handled by the websocket app
++                // interface before requests reach this API. Other callers have no
++                // connection to subscribe, so this is a no-op for them.
++                Ok(AppResponse::Ok)
++            }
+             AppRequest::EnableApp => {
+                 let status = self
+                     .conductor_handle
+diff --git a/crates/holochain/src/conductor/conductor.rs b/crates/holochain/src/conductor/conductor.rs
+index 5c0b795..19cc37a 100755
+--- a/crates/holochain/src/conductor/conductor.rs
++++ b/crates/holochain/src/conductor/conductor.rs
+@@ -2643,11 +2643,96 @@ mod app_status_impls {
+     }
+ }
+ 
++/// Delivers integrated-op notifications from a DNA's `DhtStore` as
++/// `SystemSignal::OpsIntegrated`. Holds a weak handle: the conductor owns the
++/// spaces that own the store.
++pub(crate) struct OpsIntegratedObserver {
++    conductor: std::sync::Weak<Conductor>,
++    dna_hash: DnaHash,
++}
++
++impl OpsIntegratedObserver {
++    pub(crate) fn new(conductor: &ConductorHandle, dna_hash: DnaHash) -> Self {
++        Self {
++            conductor: Arc::downgrade(conductor),
++            dna_hash,
++        }
++    }
++}
++
++impl holochain_state::dht_store::IntegratedOpsObserver for OpsIntegratedObserver {
++    fn is_active(&self) -> bool {
++        self.conductor
++            .upgrade()
++            .is_some_and(|c| c.wants_ops_integrated())
++    }
++
++    fn ops_integrated(
++        &self,
++        when_integrated: Timestamp,
++        ops: Vec<holochain_types::signal::IntegratedOp>,
++    ) {
++        if let Some(c) = self.conductor.upgrade() {
++            c.notify_ops_integrated(self.dna_hash.clone(), when_integrated, ops);
++        }
++    }
++}
++
+ /// Methods related to management of Conductor state
+ mod state_impls {
+     use super::*;
+ 
+     impl Conductor {
++        /// Whether any app connection opted in to `SystemSignal::OpsIntegrated`.
++        pub(crate) fn wants_ops_integrated(&self) -> bool {
++            self.app_broadcast.has_ops_integrated_subscribers()
++        }
++
++        /// Send `SystemSignal::OpsIntegrated` to every enabled app with a cell of
++        /// `dna_hash`. Never blocks the caller: the target apps are resolved on a spawned
++        /// task and signals use the non-blocking per-app broadcast channels, which drop
++        /// signals for lagging connections. Only opted-in connections forward them.
++        pub(crate) fn notify_ops_integrated(
++            self: &Arc<Self>,
++            dna_hash: DnaHash,
++            when_integrated: Timestamp,
++            ops: Vec<holochain_types::signal::IntegratedOp>,
++        ) {
++            use holochain_types::signal::OPS_INTEGRATED_MAX_OPS_PER_SIGNAL;
++            if ops.is_empty() || !self.wants_ops_integrated() {
++                return;
++            }
++            let conductor = self.clone();
++            tokio::spawn(async move {
++                let state = match conductor.get_state().await {
++                    Ok(s) => s,
++                    Err(err) => {
++                        tracing::warn!(?err, "OpsIntegrated: could not read conductor state");
++                        return;
++                    }
++                };
++                let apps: Vec<InstalledAppId> = state
++                    .enabled_apps()
++                    .filter(|(_, app)| app.all_cells().any(|c| *c.dna_hash() == dna_hash))
++                    .map(|(id, _)| id.clone())
++                    .collect();
++                for chunk in ops.chunks(OPS_INTEGRATED_MAX_OPS_PER_SIGNAL) {
++                    let signal = Signal::System(SystemSignal::OpsIntegrated {
++                        dna_hash: dna_hash.clone(),
++                        when_integrated,
++                        ops: chunk.to_vec(),
++                    });
++                    for app in &apps {
++                        // Err only means nobody is subscribed to this app right now.
++                        let _ = conductor
++                            .app_broadcast
++                            .create_send_handle(app.clone())
++                            .send(signal.clone());
++                    }
++                }
++            });
++        }
++
+         #[cfg_attr(feature = "instrument", tracing::instrument(skip_all))]
+         pub(crate) async fn get_state(&self) -> ConductorResult<ConductorState> {
+             self.spaces.get_state().await
+diff --git a/crates/holochain/src/conductor/conductor/app_broadcast.rs b/crates/holochain/src/conductor/conductor/app_broadcast.rs
+index 21b0335..45cd7d9 100644
+--- a/crates/holochain/src/conductor/conductor/app_broadcast.rs
++++ b/crates/holochain/src/conductor/conductor/app_broadcast.rs
+@@ -2,6 +2,7 @@ use holochain_types::app::InstalledAppId;
+ use holochain_types::prelude::*;
+ use std::collections::hash_map::Entry;
+ use std::collections::{HashMap, HashSet};
++use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::Arc;
+ use tokio::sync::broadcast;
+ 
+@@ -15,15 +16,42 @@ const SIGNAL_BUFFER_SIZE: usize = 64;
+ #[derive(Debug, Clone)]
+ pub struct AppBroadcast {
+     channels: Arc<parking_lot::Mutex<HashMap<InstalledAppId, broadcast::Sender<Signal>>>>,
++    /// Number of app connections that opted in to `SystemSignal::OpsIntegrated`.
++    ops_integrated_subscribers: Arc<AtomicUsize>,
++}
++
++/// Held by an app connection that opted in to `SystemSignal::OpsIntegrated`.
++/// Dropping it (when the connection's tasks end) removes the subscription.
++#[derive(Debug)]
++pub struct OpsIntegratedSubscription(Arc<AtomicUsize>);
++
++impl Drop for OpsIntegratedSubscription {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::Relaxed);
++    }
+ }
+ 
+ impl AppBroadcast {
+     pub(crate) fn new() -> Self {
+         Self {
+             channels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
++            ops_integrated_subscribers: Arc::new(AtomicUsize::new(0)),
+         }
+     }
+ 
++    /// Register an app connection as an `OpsIntegrated` subscriber.
++    pub(crate) fn subscribe_ops_integrated(&self) -> OpsIntegratedSubscription {
++        self.ops_integrated_subscribers
++            .fetch_add(1, Ordering::Relaxed);
++        OpsIntegratedSubscription(self.ops_integrated_subscribers.clone())
++    }
++
++    /// Whether any app connection currently wants `OpsIntegrated` signals. Lets the
++    /// integration workflow skip building them entirely when nobody listens.
++    pub(crate) fn has_ops_integrated_subscribers(&self) -> bool {
++        self.ops_integrated_subscribers.load(Ordering::Relaxed) > 0
++    }
++
+     /// Create a signal sender for a specific installed app.
+     ///
+     /// The app does not actually need to be installed to call this and it does not need to be
+@@ -169,6 +197,19 @@ mod tests {
+         assert_eq!(signal_2, signal_2_rcv_2);
+     }
+ 
++    #[test]
++    fn ops_integrated_subscriptions_are_counted_until_dropped() {
++        let app_broadcast = AppBroadcast::new();
++        assert!(!app_broadcast.has_ops_integrated_subscribers());
++        let a = app_broadcast.subscribe_ops_integrated();
++        let b = app_broadcast.clone().subscribe_ops_integrated();
++        assert!(app_broadcast.has_ops_integrated_subscribers());
++        drop(a);
++        assert!(app_broadcast.has_ops_integrated_subscribers());
++        drop(b);
++        assert!(!app_broadcast.has_ops_integrated_subscribers());
++    }
++
+     #[tokio::test]
+     async fn clean_up_unused_senders() {
+         let app_broadcast = AppBroadcast::new();
+diff --git a/crates/holochain/src/conductor/interface/websocket.rs b/crates/holochain/src/conductor/interface/websocket.rs
+index 903bcfb..85e31ba 100644
+--- a/crates/holochain/src/conductor/interface/websocket.rs
++++ b/crates/holochain/src/conductor/interface/websocket.rs
+@@ -3,7 +3,7 @@
+ 
+ use super::error::InterfaceResult;
+ use crate::conductor::api::{AdminInterfaceApi, AppAuthentication, AppInterfaceApi};
+-use crate::conductor::conductor::app_broadcast::AppBroadcast;
++use crate::conductor::conductor::app_broadcast::{AppBroadcast, OpsIntegratedSubscription};
+ use crate::conductor::manager::TaskManagerClient;
+ use crate::conductor::metrics::dropped_signal_metric;
+ use holochain_conductor_api::{
+@@ -12,7 +12,7 @@ use holochain_conductor_api::{
+ };
+ use holochain_serialized_bytes::SerializedBytes;
+ use holochain_types::app::InstalledAppId;
+-use holochain_types::signal::Signal;
++use holochain_types::signal::{Signal, SystemSignal};
+ use holochain_types::websocket::AllowedOrigins;
+ use holochain_websocket::WebsocketConfig;
+ use holochain_websocket::WebsocketListener;
+@@ -20,7 +20,7 @@ use holochain_websocket::WebsocketReceiver;
+ use holochain_websocket::WebsocketSender;
+ use holochain_websocket::{ReceiveMessage, WebsocketError};
+ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+-use std::sync::Arc;
++use std::sync::{Arc, OnceLock};
+ use tokio::pin;
+ use tokio::sync::broadcast;
+ use tokio::task::JoinHandle;
+@@ -163,6 +163,10 @@ pub fn spawn_admin_interface_tasks(
+     });
+ }
+ 
++/// Per-connection opt-in to `SystemSignal::OpsIntegrated`, shared by the connection's
++/// request and signal tasks. The subscription ends when both tasks have finished.
++type OpsIntegratedOptIn = Arc<OnceLock<OpsIntegratedSubscription>>;
++
+ /// Create an App Interface, which includes the ability to receive signals
+ /// from Cells via a broadcast channel
+ pub async fn spawn_app_interface_task(
+@@ -321,6 +325,8 @@ fn authenticate_incoming_app_connection(
+                             // Once authentication passes we know which app this connection is for,
+                             // so we can subscribe to app signals now.
+                             let rx_from_cell = app_broadcast.subscribe(installed_app_id.clone());
++                            // Set once this connection sends `SubscribeOpsIntegrated`.
++                            let ops_integrated: OpsIntegratedOptIn = Arc::new(OnceLock::new());
+ 
+                             spawn_app_signals_handler(
+                                 task_list.clone(),
+@@ -328,12 +334,15 @@ fn authenticate_incoming_app_connection(
+                                 tx_to_iface.clone(),
+                                 port,
+                                 installed_app_id.clone(),
++                                ops_integrated.clone(),
+                             );
+                             spawn_recv_incoming_app_msgs(
+                                 task_list,
+                                 api,
+                                 rx_from_iface,
+                                 installed_app_id,
++                                app_broadcast,
++                                ops_integrated,
+                             );
+                         }
+                         Err(e) => {
+@@ -357,6 +366,7 @@ fn spawn_app_signals_handler(
+     tx_to_iface: WebsocketSender,
+     port: u16,
+     installed_app_id: InstalledAppId,
++    ops_integrated: OpsIntegratedOptIn,
+ ) {
+     use futures::stream::StreamExt;
+ 
+@@ -391,6 +401,13 @@ fn spawn_app_signals_handler(
+         pin!(rx_from_cell);
+         loop {
+             if let Some(signal) = rx_from_cell.next().await {
++                // Only connections that opted in receive `OpsIntegrated`: older clients
++                // cannot decode the variant.
++                if matches!(signal, Signal::System(SystemSignal::OpsIntegrated { .. }))
++                    && ops_integrated.get().is_none()
++                {
++                    continue;
++                }
+                 trace!(msg = "Sending signal!", ?signal);
+                 if let Err(err) = tx_to_iface.signal(signal).await {
+                     if let WebsocketError::Close(_) = err {
+@@ -418,6 +435,8 @@ fn spawn_recv_incoming_app_msgs(
+     api: AppInterfaceApi,
+     rx_from_iface: WebsocketReceiver,
+     installed_app_id: InstalledAppId,
++    app_broadcast: AppBroadcast,
++    ops_integrated: OpsIntegratedOptIn,
+ ) {
+     use futures::stream::StreamExt;
+ 
+@@ -452,8 +471,17 @@ fn spawn_recv_incoming_app_msgs(
+             move |msg| {
+                 let installed_app_id = installed_app_id.clone();
+                 let api = api.clone();
++                let app_broadcast = app_broadcast.clone();
++                let ops_integrated = ops_integrated.clone();
+                 async move {
+-                    if let Err(err) = handle_incoming_app_message(msg, installed_app_id, api).await
++                    if let Err(err) = handle_incoming_app_message(
++                        msg,
++                        installed_app_id,
++                        api,
++                        &app_broadcast,
++                        &ops_integrated,
++                    )
++                    .await
+                     {
+                         error!(?err, "error handling app websocket message");
+                     }
+@@ -509,6 +537,8 @@ async fn handle_incoming_app_message(
+     ws_msg: ReceiveMessage<AppRequest>,
+     installed_app_id: InstalledAppId,
+     api: AppInterfaceApi,
++    app_broadcast: &AppBroadcast,
++    ops_integrated: &OpsIntegratedOptIn,
+ ) -> InterfaceResult<()> {
+     match ws_msg {
+         ReceiveMessage::Signal(_) => {
+@@ -521,7 +551,13 @@ async fn handle_incoming_app_message(
+         }
+         ReceiveMessage::Request(data, respond) => {
+             use holochain_serialized_bytes::SerializedBytesError;
+-            let result: AppResponse = api.handle_request(installed_app_id, Ok(data)).await?;
++            let result: AppResponse = if matches!(data, AppRequest::SubscribeOpsIntegrated) {
++                // Per-connection opt-in; idempotent.
++                ops_integrated.get_or_init(|| app_broadcast.subscribe_ops_integrated());
++                AppResponse::Ok
++            } else {
++                api.handle_request(installed_app_id, Ok(data)).await?
++            };
+             // Have to jump through some hoops, because our response type
+             // only implements try_into, but the responder needs try_from.
+             let result = result.try_into();
+diff --git a/crates/holochain/src/core/queue_consumer.rs b/crates/holochain/src/core/queue_consumer.rs
+index 0f2fd7f..bd17e21 100644
+--- a/crates/holochain/src/core/queue_consumer.rs
++++ b/crates/holochain/src/core/queue_consumer.rs
+@@ -105,6 +105,12 @@ pub(crate) fn spawn_space_validation_consumers(
+     let keystore = conductor.keystore().clone();
+     let queue_consumer_map = conductor.get_queue_consumer_workflows();
+ 
++    // Opt-in `SystemSignal::OpsIntegrated`: observe every op the space's store
++    // commits as integrated. Set once per space; later calls are no-ops.
++    space.dht_store.set_integrated_ops_observer(Arc::new(
++        crate::conductor::conductor::OpsIntegratedObserver::new(&conductor, (*dna_hash).clone()),
++    ));
++
+     // Validation Receipt
+     // One per space.
+     let tx_receipt = queue_consumer_map.spawn_once_validation_receipt(dna_hash.clone(), || {
+diff --git a/crates/holochain_conductor_api/src/app_interface.rs b/crates/holochain_conductor_api/src/app_interface.rs
+index 60f268f..39ad962 100644
+--- a/crates/holochain_conductor_api/src/app_interface.rs
++++ b/crates/holochain_conductor_api/src/app_interface.rs
+@@ -262,6 +262,19 @@ pub enum AppRequest {
+     /// [`AppResponse::ListWasmHostFunctions`]
+     ListWasmHostFunctions,
+ 
++    /// Opt this websocket connection in to `SystemSignal::OpsIntegrated` signals for the
++    /// DNAs of this app.
++    ///
++    /// Connections that never send this request never receive those signals, so existing
++    /// clients that cannot decode the variant are unaffected. The subscription lasts until
++    /// the connection closes. Delivery is best effort; reconcile with
++    /// [`AppRequest::DumpOpTimings`].
++    ///
++    /// # Returns
++    ///
++    /// [`AppResponse::Ok`]
++    SubscribeOpsIntegrated,
++
+     /// Provide the membrane proofs for this app, if this app was installed
+     /// using `allow_deferred_memproofs` and memproofs were not provided at
+     /// installation time.
+diff --git a/crates/holochain_state/src/dht_store.rs b/crates/holochain_state/src/dht_store.rs
+index f0b7f13..7d6b627 100644
+--- a/crates/holochain_state/src/dht_store.rs
++++ b/crates/holochain_state/src/dht_store.rs
+@@ -13,6 +13,7 @@ use holochain_data::dht::{
+ use holochain_data::kind::Dht;
+ use holochain_data::DbWrite;
+ use holochain_types::op::{DhtOp, DhtOpHashed};
++use std::sync::Arc;
+ use holochain_types::prelude::{Schedule, ScheduledFn, Timestamp};
+ use holochain_zome_types::schedule::ScheduleError;
+ 
+@@ -143,12 +144,65 @@ use holochain_zome_types::prelude::{Action, ActionData, OpValidity, SignedAction
+ #[derive(Clone, Debug)]
+ pub struct DhtStore<Db = DbWrite<Dht>> {
+     db: Db,
++    integrated_observer: IntegratedOpsObserverSlot,
++}
++
++/// Notified after DHT ops are committed as integrated: by the integration
++/// workflow, and by source-chain flushes that write self-authored ops as
++/// integrated. Implementations must return quickly and never block.
++pub trait IntegratedOpsObserver: Send + Sync {
++    /// Cheap check; when it returns false, no notification is built.
++    fn is_active(&self) -> bool;
++    /// Called after the commit, outside any database transaction.
++    fn ops_integrated(
++        &self,
++        when_integrated: Timestamp,
++        ops: Vec<holochain_types::signal::IntegratedOp>,
++    );
++}
++
++/// Shared by every clone of a `DhtStore`, so an observer set once on the
++/// space's store sees writes made through any clone (workflows, source chains).
++#[derive(Clone, Default)]
++struct IntegratedOpsObserverSlot(Arc<std::sync::OnceLock<Arc<dyn IntegratedOpsObserver>>>);
++
++impl std::fmt::Debug for IntegratedOpsObserverSlot {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_tuple("IntegratedOpsObserverSlot")
++            .field(&self.0.get().is_some())
++            .finish()
++    }
+ }
+ 
+ impl<Db> DhtStore<Db> {
+     /// Create a new `DhtStore` from a database handle.
+     pub fn new(db: Db) -> Self {
+-        Self { db }
++        Self {
++            db,
++            integrated_observer: IntegratedOpsObserverSlot::default(),
++        }
++    }
++
++    /// Install the observer for ops integrated through this store and all of
++    /// its clones. Only the first call has an effect; returns whether it did.
++    pub fn set_integrated_ops_observer(&self, observer: Arc<dyn IntegratedOpsObserver>) -> bool {
++        self.integrated_observer.0.set(observer).is_ok()
++    }
++
++    /// Notify the observer, if any and active. `ops` is only evaluated then.
++    pub(crate) fn notify_integrated(
++        &self,
++        when_integrated: Timestamp,
++        ops: impl FnOnce() -> Vec<holochain_types::signal::IntegratedOp>,
++    ) {
++        if let Some(observer) = self.integrated_observer.0.get() {
++            if observer.is_active() {
++                let ops = ops();
++                if !ops.is_empty() {
++                    observer.ops_integrated(when_integrated, ops);
++                }
++            }
++        }
+     }
+ 
+     /// Access the raw database handle.
+@@ -860,6 +914,15 @@ impl DhtStore<DbWrite<Dht>> {
+         }
+ 
+         tx.commit().await.map_err(StateMutationError::from)?;
++        self.notify_integrated(when_integrated, || {
++            out.iter()
++                .map(|s| holochain_types::signal::IntegratedOp {
++                    op_hash: s.op_hash.clone(),
++                    basis_hash: s.basis_hash.clone(),
++                    validity: s.validation_status,
++                })
++                .collect()
++        });
+         Ok(out)
+     }
+ 
+diff --git a/crates/holochain_state/src/dht_store/tests.rs b/crates/holochain_state/src/dht_store/tests.rs
+index a2ed8c0..ad2408a 100644
+--- a/crates/holochain_state/src/dht_store/tests.rs
++++ b/crates/holochain_state/src/dht_store/tests.rs
+@@ -3110,3 +3110,65 @@ mod publish_query {
+         assert_eq!(ops_to_publish(&dht_store, &agent).await.len(), 0);
+     }
+ }
++
++/// Records `OpsIntegrated` notifications for the observer tests.
++#[derive(Default)]
++struct RecordingObserver {
++    active: std::sync::atomic::AtomicBool,
++    seen: std::sync::Mutex<Vec<(Timestamp, Vec<holochain_types::signal::IntegratedOp>)>>,
++}
++
++impl IntegratedOpsObserver for RecordingObserver {
++    fn is_active(&self) -> bool {
++        self.active.load(std::sync::atomic::Ordering::SeqCst)
++    }
++    fn ops_integrated(&self, when: Timestamp, ops: Vec<holochain_types::signal::IntegratedOp>) {
++        self.seen.lock().unwrap().push((when, ops));
++    }
++}
++
++#[tokio::test]
++async fn integrate_ready_ops_notifies_observer_through_clones() {
++    let store = DhtStore::new_test(dht_id()).await.unwrap();
++    let observer = Arc::new(RecordingObserver::default());
++    // Installed on the original, used through a clone (as workflows do).
++    assert!(store.set_integrated_ops_observer(observer.clone()));
++    assert!(!store.set_integrated_ops_observer(observer.clone()), "set once");
++    let clone = store.clone();
++
++    let ready = |n: u8| {
++        let op = build_test_store_record_op_hashed(n.into());
++        let clone = clone.clone();
++        async move {
++            clone.record_incoming_ops(vec![op.clone()]).await.unwrap();
++            clone
++                .record_chain_op_sys_validation_outcomes(vec![(
++                    op.0.as_hash().clone(),
++                    SysOutcome::Accepted,
++                )])
++                .await
++                .unwrap();
++            clone
++                .record_app_validation_outcomes(vec![(op.0.as_hash().clone(), AppOutcome::Accepted)])
++                .await
++                .unwrap();
++            op
++        }
++    };
++
++    // Inactive observer: nothing is built or delivered.
++    ready(60).await;
++    clone.integrate_ready_ops(Timestamp::from_micros(1)).await.unwrap();
++    assert!(observer.seen.lock().unwrap().is_empty());
++
++    // Active observer: notified after commit with hash, basis and validity.
++    observer.active.store(true, std::sync::atomic::Ordering::SeqCst);
++    let op = ready(61).await;
++    clone.integrate_ready_ops(Timestamp::from_micros(2)).await.unwrap();
++    let seen = observer.seen.lock().unwrap();
++    assert_eq!(seen.len(), 1);
++    assert_eq!(seen[0].0, Timestamp::from_micros(2));
++    assert_eq!(seen[0].1.len(), 1);
++    assert_eq!(&seen[0].1[0].op_hash, op.0.as_hash());
++    assert_eq!(seen[0].1[0].validity, OpValidity::Accepted);
++}
+diff --git a/crates/holochain_state/src/source_chain.rs b/crates/holochain_state/src/source_chain.rs
+index 2b6974e..ab5710e 100644
+--- a/crates/holochain_state/src/source_chain.rs
++++ b/crates/holochain_state/src/source_chain.rs
+@@ -310,6 +310,9 @@ impl SourceChain<DbWrite<Dht>> {
+         // The permit is acquired and released *inside* this async block so it
+         // is not held when the relaxed-ordering rebase below recurses into
+         // `flush` (which re-acquires it).
++        // Self-authored ops written as integrated by this flush (for the
++        // `IntegratedOpsObserver`; reported only once the commit succeeded).
++        let mut integrated_now: Vec<holochain_types::signal::IntegratedOp> = Vec::new();
+         let chain_flush_result: SourceChainResult<Vec<SignedActionHashed>> = async {
+             let _chain_write_permit = self
+                 .dht_store
+@@ -450,6 +453,11 @@ impl SourceChain<DbWrite<Dht>> {
+                 if !inserted_action_hashes.contains(op.action_hash()) {
+                     continue;
+                 }
++                integrated_now.push(holochain_types::signal::IntegratedOp {
++                    op_hash: op.op_hash.clone(),
++                    basis_hash: op.basis_hash.clone(),
++                    validity: RecordValidity::Accepted,
++                });
+                 let storage_center_loc = op.storage_center_loc;
+                 let timestamp = op.action.action().timestamp();
+ 
+@@ -548,6 +556,11 @@ impl SourceChain<DbWrite<Dht>> {
+                 }
+             }
+             Ok(actions) => {
++                // Self-authored ops were written as integrated (no integration
++                // workflow involved); tell the observer like the workflow does.
++                self.dht_store
++                    .notify_integrated(Timestamp::now(), || std::mem::take(&mut integrated_now));
++
+                 // Verify warrant signatures, then record the valid ones into the
+                 // DhtStore so `ops_pending_sys_validation` picks them up via
+                 // `LimboWarrant`.
+diff --git a/crates/holochain_types/src/signal.rs b/crates/holochain_types/src/signal.rs
+index 2c0b608..a94c5e6 100644
+--- a/crates/holochain_types/src/signal.rs
++++ b/crates/holochain_types/src/signal.rs
+@@ -71,6 +71,35 @@ pub enum SystemSignal {
+         /// Why the restore is unrecoverable.
+         reason: UnrecoverableCellReason,
+     },
++    /// DHT ops held by this conductor for `dna_hash` finished validation and were integrated.
++    ///
++    /// Opt-in and best effort. It is only delivered on app websocket connections that sent
++    /// `AppRequest::SubscribeOpsIntegrated`, so clients that cannot decode this variant never
++    /// see it. Signals can be dropped when a connection lags, and are not replayed after a
++    /// reconnect: use `AppRequest::DumpOpTimings` to reconcile.
++    OpsIntegrated {
++        /// The DNA (DHT space) the ops belong to.
++        dna_hash: DnaHash,
++        /// When this integration batch ran.
++        when_integrated: Timestamp,
++        /// The integrated ops, at most [`OPS_INTEGRATED_MAX_OPS_PER_SIGNAL`] per signal.
++        ops: Vec<IntegratedOp>,
++    },
++}
++
++/// The largest number of ops carried by one [`SystemSignal::OpsIntegrated`]. Larger
++/// integration batches are split across several signals.
++pub const OPS_INTEGRATED_MAX_OPS_PER_SIGNAL: usize = 500;
++
++/// One DHT op reported by [`SystemSignal::OpsIntegrated`].
++#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
++pub struct IntegratedOp {
++    /// Hash of the integrated op.
++    pub op_hash: DhtOpHash,
++    /// DHT basis (address) the op is stored at.
++    pub basis_hash: AnyLinkableHash,
++    /// Outcome of validation.
++    pub validity: OpValidity,
+ }
+ 
+ impl_from! {

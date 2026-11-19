@@ -279,6 +279,10 @@ pub struct EventEnvelope {
     /// When the relay observed the change (unix milliseconds, relay clock).
     /// Diagnostic only: never use for ordering.
     pub observed_at_ms: u64,
+    /// When the change happened at its origin, if the source reports it
+    /// (e.g. the conductor's integration time). Diagnostic only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at_ms: Option<u64>,
     /// Identifier of the relay change source that produced the event.
     pub source: String,
 }
@@ -360,6 +364,23 @@ pub struct SyncPage {
     pub head_cursor: Cursor,
     /// True if more events are available; call again with `next_cursor`.
     pub has_more: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Peer hints
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/peers?space=...` response body.
+///
+/// Signed peer records of the relay's own conductor for `space`, as Kitsune2
+/// `AgentInfoSigned` JSON strings. A client hands them to its own conductor
+/// (Holochain `AddAgentInfo`), which verifies the signatures, so that it can
+/// gossip directly with this always-on peer. Not validated or interpreted by
+/// the relay protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeersResponse {
+    pub space: String,
+    pub agent_infos: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +494,10 @@ pub struct Capabilities {
     pub limits: LimitsInfo,
     /// Notification transports offered: `"sse"`, and later `"web_push"`.
     pub transports: Vec<String>,
+    /// `GET /v1/peers` is available (signed peer records of the relay's
+    /// own conductor).
+    #[serde(default)]
+    pub peer_hints: bool,
     pub registration: RegistrationMode,
 }
 

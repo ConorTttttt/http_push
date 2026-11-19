@@ -44,6 +44,7 @@ impl MockInjector {
                 space: space.to_string(),
                 kind: ChangeKind::MockChange,
                 refs: vec![ChangeRef::new(RefType::Mock, id.clone())],
+                occurred_at_ms: None,
             })
             .collect();
         let (tx, rx) = oneshot::channel();
@@ -108,6 +109,7 @@ impl ChangeSource for MockSource {
                             space: s.clone(),
                             kind: ChangeKind::MockChange,
                             refs: vec![ChangeRef::new(RefType::Mock, format!("tick-{tick}"))],
+                            occurred_at_ms: None,
                         }).collect();
                         if let Err(e) = ctx.sink.submit(changes, Some(tick.to_string())).await {
                             tracing::warn!(error = %e, "mock source submit failed");

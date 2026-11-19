@@ -18,6 +18,7 @@ pub mod auth;
 pub mod config;
 pub mod ingest;
 pub mod journal;
+pub mod metrics;
 pub mod mock;
 pub mod rate_limit;
 pub mod server;

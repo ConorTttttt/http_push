@@ -18,11 +18,13 @@ pub mod sse;
 pub mod state;
 
 use hc_push_protocol::{
-    ApiError, Cursor, ErrorBody, ErrorCode, EventEnvelope, SubscribeRequest, SubscribeResponse,
-    SyncPage, SyncRequired, SSE_EVENT_CHANGE, SSE_EVENT_SYNC_REQUIRED,
+    ApiError, Cursor, ErrorBody, ErrorCode, EventEnvelope, PeersResponse, SubscribeRequest,
+    SubscribeResponse, SyncPage, SyncRequired, SSE_EVENT_CHANGE, SSE_EVENT_SYNC_REQUIRED,
 };
 use reqwest::StatusCode;
 pub use state::{ClientState, FileStateStore, MemoryStateStore, RelayState, StateStore};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// One configured relay.
@@ -132,6 +134,91 @@ pub struct SyncReport {
     pub duplicates: usize,
     /// First relay that synced successfully.
     pub served_by: Option<String>,
+    /// Wall time of the whole call.
+    pub duration_ms: u64,
+    /// HTTP traffic caused by this call.
+    pub transfer: TransferStats,
+    pub latency: LatencyReport,
+}
+
+/// HTTP traffic as seen by the client: request line, headers and body sent;
+/// status line, headers and body received. Header sizes are estimates;
+/// TLS and TCP overhead are not included.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TransferStats {
+    pub requests: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+impl TransferStats {
+    fn since(self, earlier: TransferStats) -> TransferStats {
+        TransferStats {
+            requests: self.requests - earlier.requests,
+            bytes_sent: self.bytes_sent - earlier.bytes_sent,
+            bytes_received: self.bytes_received - earlier.bytes_received,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TransferCounters {
+    requests: AtomicU64,
+    sent: AtomicU64,
+    received: AtomicU64,
+}
+
+impl TransferCounters {
+    fn snapshot(&self) -> TransferStats {
+        TransferStats {
+            requests: self.requests.load(Ordering::Relaxed),
+            bytes_sent: self.sent.load(Ordering::Relaxed),
+            bytes_received: self.received.load(Ordering::Relaxed),
+        }
+    }
+
+    fn add_received(&self, n: usize) {
+        self.received.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+/// Summary of a latency sample in milliseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LatencySummary {
+    pub count: usize,
+    pub min_ms: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub max_ms: u64,
+}
+
+impl LatencySummary {
+    pub fn of(mut v: Vec<u64>) -> Self {
+        if v.is_empty() {
+            return Self::default();
+        }
+        v.sort_unstable();
+        let at = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+        Self {
+            count: v.len(),
+            min_ms: v[0],
+            p50_ms: at(0.5),
+            p95_ms: at(0.95),
+            max_ms: v[v.len() - 1],
+        }
+    }
+}
+
+/// Latency of delivered events, measured when the app handler accepted
+/// them. Uses wall clocks of different machines when the client and relay
+/// run on different hosts, so treat cross-host values with care.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LatencyReport {
+    /// `delivered_at - observed_at_ms`: relay journal to app.
+    pub relay_to_app: LatencySummary,
+    /// `delivered_at - occurred_at_ms`: origin (e.g. conductor integration)
+    /// to app, for events whose source reports it.
+    pub origin_to_app: LatencySummary,
 }
 
 impl SyncReport {
@@ -172,6 +259,10 @@ pub struct ListenOutcome {
     pub delivered: usize,
     pub duplicates: usize,
     pub sync: Option<SyncReport>,
+    pub duration_ms: u64,
+    /// HTTP traffic of the stream (and of the follow-up sync, if any).
+    pub transfer: TransferStats,
+    pub latency: LatencyReport,
 }
 
 /// What the app does with a new change. Returning an error stops the sync
@@ -185,6 +276,9 @@ pub struct PushClient {
     store: Box<dyn StateStore>,
     state: ClientState,
     opts: ClientOptions,
+    counters: Arc<TransferCounters>,
+    lat_relay: Vec<u64>,
+    lat_origin: Vec<u64>,
 }
 
 fn now_ms() -> u64 {
@@ -194,7 +288,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-async fn error_from_response(resp: reqwest::Response) -> RelayError {
+fn header_bytes(h: &reqwest::header::HeaderMap) -> usize {
+    h.iter()
+        .map(|(k, v)| k.as_str().len() + v.len() + 4)
+        .sum::<usize>()
+        + 2
+}
+
+async fn error_from_response(resp: reqwest::Response, counters: &TransferCounters) -> RelayError {
     let status = resp.status();
     let retry_after = resp
         .headers()
@@ -202,7 +303,11 @@ async fn error_from_response(resp: reqwest::Response) -> RelayError {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs);
-    let body: Option<ApiError> = resp.json::<ErrorBody>().await.ok().map(|b| b.error);
+    let bytes = resp.bytes().await.unwrap_or_default();
+    counters.add_received(bytes.len());
+    let body: Option<ApiError> = serde_json::from_slice::<ErrorBody>(&bytes)
+        .ok()
+        .map(|b| b.error);
     match status {
         StatusCode::UNAUTHORIZED => RelayError::Unauthorized,
         StatusCode::GONE => RelayError::Gap {
@@ -258,7 +363,88 @@ impl PushClient {
             store,
             state,
             opts,
+            counters: Arc::default(),
+            lat_relay: Vec::new(),
+            lat_origin: Vec::new(),
         })
+    }
+
+    /// Total HTTP traffic of this client instance.
+    pub fn transfer_totals(&self) -> TransferStats {
+        self.counters.snapshot()
+    }
+
+    /// Send a request, accounting for its bytes.
+    async fn execute(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::Response, RelayError> {
+        let req = rb.build().map_err(transport_error)?;
+        let url = req.url();
+        // Request line + headers (+ Host and User-Agent added by the stack) + body.
+        let sent = req.method().as_str().len()
+            + url.path().len()
+            + url.query().map(|q| q.len() + 1).unwrap_or(0)
+            + 11
+            + header_bytes(req.headers())
+            + url.host_str().map(|h| h.len() + 12).unwrap_or(0)
+            + 33
+            + req
+                .body()
+                .and_then(|b| b.as_bytes())
+                .map(|b| b.len())
+                .unwrap_or(0);
+        self.counters.requests.fetch_add(1, Ordering::Relaxed);
+        self.counters.sent.fetch_add(sent as u64, Ordering::Relaxed);
+        let resp = self.http.execute(req).await.map_err(transport_error)?;
+        self.counters
+            .add_received(17 + header_bytes(resp.headers()));
+        Ok(resp)
+    }
+
+    /// Read a JSON body, accounting for its bytes.
+    async fn json_body<T: serde::de::DeserializeOwned>(
+        &self,
+        resp: reqwest::Response,
+    ) -> Result<T, RelayError> {
+        let bytes = resp.bytes().await.map_err(transport_error)?;
+        self.counters.add_received(bytes.len());
+        serde_json::from_slice(&bytes).map_err(|e| RelayError::Protocol(e.to_string()))
+    }
+
+    fn reset_latency(&mut self) {
+        self.lat_relay.clear();
+        self.lat_origin.clear();
+    }
+
+    fn latency_report(&self) -> LatencyReport {
+        LatencyReport {
+            relay_to_app: LatencySummary::of(self.lat_relay.clone()),
+            origin_to_app: LatencySummary::of(self.lat_origin.clone()),
+        }
+    }
+
+    /// Signed peer records of `relay`'s own conductor for `space`
+    /// (`GET /v1/peers`). Hand them to the app's own conductor (Holochain
+    /// `AddAgentInfo`), which verifies the signatures, to gossip with that
+    /// always-on peer directly.
+    pub async fn peer_hints(&mut self, name: &str, space: &str) -> Result<Vec<String>, RelayError> {
+        self.endpoint(name)?;
+        if !self.state.relays.contains_key(name) {
+            self.register(name).await?;
+        }
+        let rs = self.state.relays[name].clone();
+        let resp = self
+            .execute(
+                self.http
+                    .get(Self::url(&rs.url, "/v1/peers"))
+                    .timeout(self.opts.request_timeout)
+                    .bearer_auth(&rs.token)
+                    .query(&[("space", space)]),
+            )
+            .await?;
+        if resp.status() != StatusCode::OK {
+            return Err(error_from_response(resp, &self.counters).await);
+        }
+        let body: PeersResponse = self.json_body(resp).await?;
+        Ok(body.agent_infos)
     }
 
     pub fn state(&self) -> &ClientState {
@@ -301,14 +487,11 @@ impl PushClient {
         if let Some(k) = &ep.registration_key {
             req = req.bearer_auth(k);
         }
-        let resp = req.send().await.map_err(transport_error)?;
+        let resp = self.execute(req).await?;
         if resp.status() != StatusCode::CREATED {
-            return Err(error_from_response(resp).await);
+            return Err(error_from_response(resp, &self.counters).await);
         }
-        let sub: SubscribeResponse = resp
-            .json()
-            .await
-            .map_err(|e| RelayError::Protocol(e.to_string()))?;
+        let sub: SubscribeResponse = self.json_body(resp).await?;
         let journal_id = sub.cursor.journal_id.clone();
         // Keep our position if the relay's journal is unchanged (e.g. our
         // subscription merely expired); otherwise start at the new head.
@@ -360,14 +543,11 @@ impl PushClient {
         if let Some(c) = &rs.cursor {
             req = req.query(&[("cursor", c.to_string())]);
         }
-        let resp = req.send().await.map_err(transport_error)?;
+        let resp = self.execute(req).await?;
         if resp.status() != StatusCode::OK {
-            return Err(error_from_response(resp).await);
+            return Err(error_from_response(resp, &self.counters).await);
         }
-        let page: SyncPage = resp
-            .json()
-            .await
-            .map_err(|e| RelayError::Protocol(e.to_string()))?;
+        let page: SyncPage = self.json_body(resp).await?;
         // Never accept a cursor from a different journal than we track.
         if page.next_cursor.journal_id != rs.journal_id
             || page
@@ -432,6 +612,11 @@ impl PushClient {
             handler(e).map_err(|err| RelayError::Handler(err.to_string()))?;
             self.state.seen.insert(&e.change_key);
             stats.delivered += 1;
+            let now = now_ms();
+            self.lat_relay.push(now.saturating_sub(e.observed_at_ms));
+            if let Some(o) = e.occurred_at_ms {
+                self.lat_origin.push(now.saturating_sub(o));
+            }
         }
         if let Some(rs) = self.state.relays.get_mut(name) {
             rs.cursor = Some(e.cursor.clone());
@@ -525,6 +710,9 @@ impl PushClient {
 
     /// Catch up according to `policy`, deduplicating across relays.
     pub async fn sync(&mut self, policy: SyncPolicy, handler: &mut Handler<'_>) -> SyncReport {
+        let started = Instant::now();
+        let before = self.counters.snapshot();
+        self.reset_latency();
         let mut report = SyncReport::default();
         for ep in self.endpoints.clone() {
             let r = self.sync_relay(&ep.name, handler, &mut report.gaps).await;
@@ -546,6 +734,9 @@ impl PushClient {
                 break;
             }
         }
+        report.duration_ms = started.elapsed().as_millis() as u64;
+        report.transfer = self.counters.snapshot().since(before);
+        report.latency = self.latency_report();
         report
     }
 
@@ -564,6 +755,9 @@ impl PushClient {
             self.register(name).await?;
         }
         let rs = self.state.relays.get(name).cloned().expect("registered");
+        let started = Instant::now();
+        let before = self.counters.snapshot();
+        self.reset_latency();
         let mut req = self
             .http
             .get(Self::url(&rs.url, "/v1/events"))
@@ -572,17 +766,15 @@ impl PushClient {
         if let Some(c) = &rs.cursor {
             req = req.header("last-event-id", c.to_string());
         }
-        let resp = tokio::time::timeout(self.opts.request_timeout, req.send())
+        let resp = tokio::time::timeout(self.opts.request_timeout, self.execute(req))
             .await
-            .map_err(|_| RelayError::Unavailable("timed out opening event stream".into()))?
-            .map_err(transport_error)?;
+            .map_err(|_| RelayError::Unavailable("timed out opening event stream".into()))??;
         if resp.status() != StatusCode::OK {
-            return Err(error_from_response(resp).await);
+            return Err(error_from_response(resp, &self.counters).await);
         }
         let mut body = resp.bytes_stream();
         let mut parser = sse::SseParser::new();
         let mut stats = RelaySyncStats::default();
-        let started = Instant::now();
         let mut last_change = Instant::now();
         let end = loop {
             let deadline_idle = opts.idle_timeout.saturating_sub(last_change.elapsed());
@@ -603,6 +795,7 @@ impl PushClient {
                     }
                     Ok(Some(Ok(b))) => b,
                 };
+            self.counters.add_received(chunk.len());
             let events = parser
                 .push(&chunk)
                 .map_err(|e| RelayError::Protocol(e.to_string()))?;
@@ -648,11 +841,15 @@ impl PushClient {
                     relay: name.to_string(),
                     result: r,
                 });
+                let latency = self.latency_report();
                 return Ok(ListenOutcome {
                     end: ListenEnd::SyncedAfterRequest,
                     delivered: stats.delivered + report.delivered,
                     duplicates: stats.duplicates + report.duplicates,
                     sync: Some(report),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    transfer: self.counters.snapshot().since(before),
+                    latency,
                 });
             }
         };
@@ -665,6 +862,9 @@ impl PushClient {
             delivered: stats.delivered,
             duplicates: stats.duplicates,
             sync: None,
+            duration_ms: started.elapsed().as_millis() as u64,
+            transfer: self.counters.snapshot().since(before),
+            latency: self.latency_report(),
         })
     }
 
@@ -674,18 +874,18 @@ impl PushClient {
             return Ok(());
         };
         let resp = self
-            .http
-            .delete(Self::url(
-                &rs.url,
-                &format!("/v1/subscriptions/{}", rs.subscription_id),
-            ))
-            .timeout(self.opts.request_timeout)
-            .bearer_auth(&rs.token)
-            .send()
-            .await
-            .map_err(transport_error)?;
+            .execute(
+                self.http
+                    .delete(Self::url(
+                        &rs.url,
+                        &format!("/v1/subscriptions/{}", rs.subscription_id),
+                    ))
+                    .timeout(self.opts.request_timeout)
+                    .bearer_auth(&rs.token),
+            )
+            .await?;
         if !(resp.status().is_success() || resp.status() == StatusCode::UNAUTHORIZED) {
-            return Err(error_from_response(resp).await);
+            return Err(error_from_response(resp, &self.counters).await);
         }
         self.state.relays.remove(name);
         self.save()

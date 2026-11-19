@@ -311,3 +311,43 @@ async fn client_reregisters_after_subscription_loss() {
     assert_eq!(ids(&log), ["while-revoked"]);
     relay.stop().await;
 }
+
+#[tokio::test]
+async fn sync_report_measures_traffic_and_latency() {
+    let relay = TestRelay::start(None).await;
+    let mut client = PushClient::new(
+        vec![endpoint("a", &relay.url)],
+        vec![SPACE.into()],
+        Box::new(MemoryStateStore::default()),
+        opts(),
+    )
+    .unwrap();
+    client.ensure_registered().await;
+    for i in 0..6 {
+        relay.inject(SPACE, &[&format!("t{i}")]).await;
+    }
+    let (_log, mut handler) = collector();
+    let report = client.sync(SyncPolicy::FirstAvailable, &mut handler).await;
+    assert_eq!(report.delivered, 6);
+    // page_size 4: two pages, two requests.
+    assert_eq!(report.transfer.requests, 2);
+    assert!(
+        report.transfer.bytes_received > 1000,
+        "{:?}",
+        report.transfer
+    );
+    assert!(report.transfer.bytes_sent > 100);
+    assert_eq!(report.latency.relay_to_app.count, 6);
+    // Mock events carry no origin time.
+    assert_eq!(report.latency.origin_to_app.count, 0);
+    assert!(report.latency.relay_to_app.max_ms < 10_000);
+    // A no-op sync is one small request.
+    let report = client.sync(SyncPolicy::FirstAvailable, &mut handler).await;
+    assert_eq!(report.transfer.requests, 1);
+    assert!(
+        report.transfer.bytes_received < 1000,
+        "{:?}",
+        report.transfer
+    );
+    relay.stop().await;
+}
