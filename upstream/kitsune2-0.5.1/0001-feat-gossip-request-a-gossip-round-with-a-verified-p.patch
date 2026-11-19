@@ -1,0 +1,407 @@
+From ec863d0ac0de72435a535cf5c7ba2b863f145ff0 Mon Sep 17 00:00:00 2001
+From: hc-push <hc-push@localhost>
+Date: Thu, 19 Nov 2026 10:44:23 +0000
+Subject: [PATCH] feat(gossip): request a gossip round with a verified peer
+
+Add an additive Gossip::request_round(url) API (default: unsupported) and
+implement it in K2Gossip. A requested peer must be a live agent in the peer
+store, so its signed agent info was verified on insert. The initiate task
+tries requested peers first, retries transient failures (e.g. the local
+relay is not registered yet right after start-up) up to 10 times, and then
+falls back to ordinary target selection. Forced initiations now also end the
+wait while the storage arc is growing and after the fetch queue drained.
+
+Responder-side rate limiting (burst tracking) is unchanged.
+---
+ crates/api/src/gossip.rs             |  18 ++
+ crates/gossip/src/gossip.rs          | 246 +++++++++++++++++++++++++++
+ crates/gossip/src/initiate.rs        |  36 +++-
+ crates/gossip/src/respond/harness.rs |   2 +
+ 4 files changed, 301 insertions(+), 1 deletion(-)
+
+diff --git a/crates/api/src/gossip.rs b/crates/api/src/gossip.rs
+index de9cf8f..e808f06 100644
+--- a/crates/api/src/gossip.rs
++++ b/crates/api/src/gossip.rs
+@@ -32,6 +32,24 @@ pub trait Gossip: 'static + Send + Sync + std::fmt::Debug {
+         &self,
+         request: GossipStateSummaryRequest,
+     ) -> BoxFut<'_, K2Result<GossipStateSummary>>;
++
++    /// Ask the gossip module to initiate its next round with `peer`.
++    ///
++    /// `peer` must be the URL of a live agent in the peer store, i.e. one
++    /// whose signed agent info was verified when it was inserted. Requests
++    /// for unknown, expired or tombstoned peers are rejected. The request
++    /// only changes which peer is chosen next; the responder applies its
++    /// usual rate limits and ordinary target selection resumes afterwards.
++    ///
++    /// The default implementation reports that this is unsupported.
++    fn request_round(&self, peer: Url) -> BoxFut<'_, K2Result<()>> {
++        let _ = peer;
++        Box::pin(async move {
++            Err(crate::K2Error::other(
++                "this gossip module does not support requested rounds",
++            ))
++        })
++    }
+ }
+ 
+ /// Trait-object [Gossip].
+diff --git a/crates/gossip/src/gossip.rs b/crates/gossip/src/gossip.rs
+index 5999486..a5c2a64 100644
+--- a/crates/gossip/src/gossip.rs
++++ b/crates/gossip/src/gossip.rs
+@@ -118,6 +118,10 @@ pub(crate) struct K2Gossip {
+     pub(crate) agent_verifier: DynVerifier,
+     pub(crate) transport: WeakDynTransport,
+     pub(crate) burst: AcceptBurstTracker,
++    /// Peers an application asked to gossip with next (see [Gossip::request_round]).
++    pub(crate) requested_rounds: RequestedRounds,
++    /// Wakes the initiate task early; set once the task is spawned.
++    pub(crate) force_initiate: Arc<OnceLock<tokio::sync::mpsc::Sender<()>>>,
+     pub(crate) _initiate_task: Arc<OnceLock<Option<DropAbortHandle>>>,
+     pub(crate) _timeout_task: Arc<OnceLock<Option<DropAbortHandle>>>,
+     pub(crate) _dht_update_task: Arc<OnceLock<Option<DropAbortHandle>>>,
+@@ -160,6 +164,8 @@ impl K2Gossip {
+             agent_verifier,
+             transport: Arc::downgrade(&transport),
+             burst: AcceptBurstTracker::new(config),
++            requested_rounds: Default::default(),
++            force_initiate: Default::default(),
+             _initiate_task: Default::default(),
+             _timeout_task: Default::default(),
+             _dht_update_task: Default::default(),
+@@ -175,6 +181,7 @@ impl K2Gossip {
+ 
+         let (force_initiate, initiate_task) =
+             spawn_initiate_task(gossip.config.clone(), Arc::downgrade(&gossip));
++        let _ = gossip.force_initiate.set(force_initiate.clone());
+         gossip
+             ._initiate_task
+             .set(Some(DropAbortHandle {
+@@ -408,6 +415,136 @@ impl Gossip for K2Gossip {
+     ) -> BoxFut<'_, K2Result<GossipStateSummary>> {
+         Box::pin(async move { self.summary(request.include_dht_summary).await })
+     }
++
++    fn request_round(&self, peer: Url) -> BoxFut<'_, K2Result<()>> {
++        Box::pin(async move {
++            // Only peers whose signed agent info is in the peer store (and was
++            // therefore verified on insert) may be requested.
++            let now = Timestamp::now();
++            let live: Vec<_> = self
++                .peer_store
++                .get_all()
++                .await?
++                .into_iter()
++                .filter(|a| {
++                    a.url.as_ref() == Some(&peer)
++                        && !a.is_tombstone
++                        && a.expires_at > now
++                })
++                .collect();
++            if live.is_empty() {
++                return Err(K2Error::other(
++                    "requested gossip peer is not a live agent in the peer store",
++                ));
++            }
++            // The peer store also holds this node's own agents.
++            let local = self.local_agent_store.get_all().await?;
++            if live
++                .iter()
++                .any(|a| local.iter().any(|l| l.agent() == &a.agent))
++            {
++                return Err(K2Error::other(
++                    "requested gossip peer is one of this node's own agents",
++                ));
++            }
++            self.requested_rounds.push(peer.clone());
++            tracing::info!(%peer, "Gossip round requested");
++            if let Some(tx) = self.force_initiate.get() {
++                let _ = tx.try_send(());
++            }
++            Ok(())
++        })
++    }
++}
++
++/// How often a requested peer is tried before ordinary selection resumes.
++pub(crate) const MAX_REQUESTED_ROUND_ATTEMPTS: u32 = 10;
++
++/// Queue of peers that an application asked to gossip with next.
++#[derive(Debug, Clone, Default)]
++pub(crate) struct RequestedRounds(
++    Arc<std::sync::Mutex<std::collections::VecDeque<(Url, u32)>>>,
++);
++
++impl RequestedRounds {
++    fn lock(
++        &self,
++    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<(Url, u32)>> {
++        self.0.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    /// Queue `peer` once; a repeated request resets its attempt count.
++    pub(crate) fn push(&self, peer: Url) {
++        let mut q = self.lock();
++        if let Some(entry) = q.iter_mut().find(|(u, _)| *u == peer) {
++            entry.1 = 0;
++        } else {
++            q.push_back((peer, 0));
++        }
++    }
++
++    /// The peer to try next, if any.
++    pub(crate) fn next(&self) -> Option<Url> {
++        self.lock().front().map(|(u, _)| u.clone())
++    }
++
++    /// A round with `peer` was initiated: forget the request.
++    pub(crate) fn done(&self, peer: &Url) {
++        self.lock().retain(|(u, _)| u != peer);
++    }
++
++    /// Initiation with `peer` failed. Keep it for another try unless it
++    /// reached [MAX_REQUESTED_ROUND_ATTEMPTS]. Returns whether it is kept.
++    pub(crate) fn failed(&self, peer: &Url) -> bool {
++        let mut q = self.lock();
++        let mut kept = true;
++        q.retain_mut(|(u, attempts)| {
++            if u != peer {
++                return true;
++            }
++            *attempts += 1;
++            kept = *attempts < MAX_REQUESTED_ROUND_ATTEMPTS;
++            kept
++        });
++        kept
++    }
++}
++
++#[cfg(test)]
++mod requested_rounds_tests {
++    use super::*;
++
++    fn url(n: u16) -> Url {
++        Url::from_str(format!("ws://127.0.0.1:{n}")).unwrap()
++    }
++
++    #[test]
++    fn fifo_dedup_and_bounded_retries() {
++        let q = RequestedRounds::default();
++        assert_eq!(q.next(), None);
++        q.push(url(1));
++        q.push(url(2));
++        q.push(url(1)); // duplicate: not queued twice
++        assert_eq!(q.next(), Some(url(1)));
++        for _ in 0..MAX_REQUESTED_ROUND_ATTEMPTS - 1 {
++            assert!(q.failed(&url(1)));
++        }
++        assert!(!q.failed(&url(1)), "dropped after the attempt budget");
++        assert_eq!(q.next(), Some(url(2)));
++        q.done(&url(2));
++        assert_eq!(q.next(), None);
++    }
++
++    #[test]
++    fn repeated_request_resets_attempts() {
++        let q = RequestedRounds::default();
++        q.push(url(1));
++        for _ in 0..MAX_REQUESTED_ROUND_ATTEMPTS - 1 {
++            q.failed(&url(1));
++        }
++        q.push(url(1));
++        assert!(q.failed(&url(1)), "budget restarted");
++    }
+ }
+ 
+ impl TxBaseHandler for K2Gossip {}
+@@ -643,6 +780,115 @@ mod test {
+         assert_eq!(op_1, received_ops[0]);
+     }
+ 
++    #[tokio::test]
++    async fn request_round_rejects_unknown_peer() {
++        enable_tracing();
++        let factory =
++            K2GossipFunctionalTestFactory::create(TEST_SPACE_ID, false, None)
++                .await;
++        let harness = factory.new_instance().await;
++        harness.join_local_agent(DhtArc::FULL).await;
++        let unknown = Url::from_str("ws://127.0.0.1:1/not-a-peer").unwrap();
++        assert!(harness.gossip.request_round(unknown).await.is_err());
++        // Its own agent is in its peer store, but is not a gossip partner.
++        let own = harness.space.current_url().expect("bound");
++        assert!(
++            harness
++                .space
++                .peer_store()
++                .get_all()
++                .await
++                .unwrap()
++                .iter()
++                .any(|a| a.url.as_ref() == Some(&own))
++        );
++        assert!(harness.gossip.request_round(own).await.is_err());
++    }
++
++    #[tokio::test]
++    async fn requested_round_syncs_without_waiting_for_the_schedule() {
++        enable_tracing();
++        // Ordinary initiation is slowed down so far that it cannot explain a
++        // sync within the test's time limit.
++        let slow = K2GossipConfig {
++            initiate_interval_ms: 60_000,
++            initial_initiate_interval_ms: 60_000,
++            min_initiate_interval_ms: 10,
++            initiate_jitter_ms: 0,
++            ..Default::default()
++        };
++        let factory = K2GossipFunctionalTestFactory::create(
++            TEST_SPACE_ID,
++            false,
++            Some(slow),
++        )
++        .await;
++
++        let make = |n: u8, t: i64| {
++            let op = MemoryOp::new(Timestamp::from_micros(t), vec![n; 128]);
++            (op.compute_op_id(), op)
++        };
++
++        let harness_1 = factory.new_instance().await;
++        harness_1.join_local_agent(DhtArc::FULL).await;
++        let harness_2 = factory.new_instance().await;
++        let agent_info_2 = harness_2.join_local_agent(DhtArc::FULL).await;
++        let harness_3 = factory.new_instance().await;
++        harness_3.join_local_agent(DhtArc::FULL).await;
++        let (op_id, op) = make(7, 100);
++        harness_2
++            .space
++            .op_store()
++            .process_incoming_ops(vec![op.clone().into()])
++            .await
++            .unwrap();
++
++        // Both 1 and 3 learn about 2; only 1 requests a round.
++        for h in [&harness_1, &harness_3] {
++            h.space
++                .peer_store()
++                .insert(vec![agent_info_2.clone()])
++                .await
++                .unwrap();
++        }
++        harness_1
++            .gossip
++            .request_round(agent_info_2.url.clone().unwrap())
++            .await
++            .unwrap();
++
++        let started = std::time::Instant::now();
++        loop {
++            let got = harness_1
++                .space
++                .op_store()
++                .retrieve_ops(vec![op_id.clone()])
++                .await
++                .unwrap();
++            if got.len() == 1 {
++                break;
++            }
++            assert!(
++                started.elapsed() < std::time::Duration::from_secs(10),
++                "requested round should sync within 10 s"
++            );
++            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++        }
++
++        // Control: without a request, 3 has not synced (its next round is a
++        // minute away).
++        assert!(
++            harness_3
++                .space
++                .op_store()
++                .retrieve_ops(vec![op_id])
++                .await
++                .unwrap()
++                .is_empty()
++        );
++        let _ = op;
++    }
++
+     #[tokio::test]
+     async fn ring_sync() {
+         enable_tracing();
+diff --git a/crates/gossip/src/initiate.rs b/crates/gossip/src/initiate.rs
+index a87f620..b2c7191 100644
+--- a/crates/gossip/src/initiate.rs
++++ b/crates/gossip/src/initiate.rs
+@@ -91,12 +91,21 @@ pub fn spawn_initiate_task(
+                     _ = delay => {
+                         tracing::info!("Wanted the fetch queue to drain but the delay expired first, proceeding with gossip initiation");
+                     }
++                    _ = force_initiate_rx.recv() => {
++                        tracing::debug!("Force initiate received while growing the storage arc, attempting initiation");
++                    }
+                     r = rx => {
+                         // If the fetch queue is empty and there's nobody to gossip with then this loop
+                         // would just spin. So use the initial initiate interval to wait a short amount of
+                         // time before trying to initiate again.
+                         // For this reason, this configuration value should be set to a small value!
+-                        tokio::time::sleep(initial_initiate_interval).await;
++                        // A forced initiation (e.g. a requested round) ends the wait early.
++                        tokio::select! {
++                            _ = tokio::time::sleep(initial_initiate_interval) => {}
++                            _ = force_initiate_rx.recv() => {
++                                tracing::debug!("Force initiate received after the fetch queue drained");
++                            }
++                        }
+ 
+                         tracing::debug!(?r, "Fetch queue drained, proceeding with gossip initiation");
+                     }
+@@ -108,6 +117,31 @@ pub fn spawn_initiate_task(
+                 continue;
+             }
+ 
++            // A peer the application asked for goes first. Failures that are
++            // likely transient (e.g. our relay is not registered yet right after
++            // start-up) are retried a bounded number of times before ordinary
++            // selection, which might pick an unreachable peer, takes over.
++            if let Some(url) = gossip.requested_rounds.next() {
++                match gossip.initiate_gossip(url.clone()).await {
++                    Ok(true) => {
++                        tracing::info!("Initiated requested gossip with {}", url);
++                        gossip.requested_rounds.done(&url);
++                    }
++                    Ok(false) => {
++                        // Busy with this peer already; try again shortly.
++                        tokio::time::sleep(initial_initiate_interval).await;
++                        let _ = here_force_initiate.try_send(());
++                    }
++                    Err(e) => {
++                        let kept = gossip.requested_rounds.failed(&url);
++                        tracing::warn!(?e, kept, "Failed to initiate requested gossip with {}", url);
++                        tokio::time::sleep(initial_initiate_interval).await;
++                        let _ = here_force_initiate.try_send(());
++                    }
++                }
++                continue;
++            }
++
+             match select_next_target(
+                 gossip.peer_store.clone(),
+                 &local_agents,
+diff --git a/crates/gossip/src/respond/harness.rs b/crates/gossip/src/respond/harness.rs
+index 8731b85..0f87f8a 100644
+--- a/crates/gossip/src/respond/harness.rs
++++ b/crates/gossip/src/respond/harness.rs
+@@ -116,6 +116,8 @@ impl RespondTestHarness {
+                 agent_verifier: builder.verifier.clone(),
+                 transport: Arc::downgrade(&transport),
+                 burst: AcceptBurstTracker::new(config),
++                requested_rounds: Default::default(),
++                force_initiate: Default::default(),
+                 _initiate_task: Default::default(),
+                 _timeout_task: Default::default(),
+                 _dht_update_task: Default::default(),

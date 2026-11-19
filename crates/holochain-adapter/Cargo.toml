@@ -26,7 +26,7 @@ holochain_types = "=0.7.1"
 
 [features]
 # Event-driven `SystemSignal::OpsIntegrated`. Only compiles against the
-# patched Holochain crates (upstream/holochain-0.7.1-ops-integrated.patch);
+# patched Holochain crates (upstream/holochain-0.7.1/0001-*.patch);
 # see scripts/build-patched-holochain.sh.
 ops-integrated-signal = []
 

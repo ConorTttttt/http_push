@@ -1,0 +1,321 @@
+From da44d8ff411d710290d26971ba557c15995a1f71 Mon Sep 17 00:00:00 2001
+From: hc-push dev <dev@localhost>
+Date: Thu, 19 Nov 2026 11:08:31 +0000
+Subject: [PATCH 2/2] feat: AppRequest::RequestGossipRound
+
+Let an app ask its conductor to start the next gossip round in one of its
+DNAs with a given peer, instead of waiting for Kitsune2's own target
+selection. The peer must already be a live agent in the conductor's peer
+store (e.g. added through AddAgentInfo, which verifies its signature).
+The URL is passed as a string, like PeerMetaInfo's.
+
+Requires Kitsune2's Gossip::request_round.
+---
+ crates/client/src/app_websocket.rs            |  21 ++++
+ .../api/api_external/app_interface.rs         |   7 ++
+ crates/holochain/src/conductor/conductor.rs   |  22 +++-
+ .../src/conductor/conductor/tests.rs          |   1 +
+ .../conductor/tests/request_gossip_round.rs   | 108 ++++++++++++++++++
+ .../src/app_interface.rs                      |  23 ++++
+ crates/holochain_p2p/src/spawn/actor.rs       |  17 +++
+ crates/holochain_p2p/src/types/actor.rs       |   8 ++
+ 8 files changed, 206 insertions(+), 1 deletion(-)
+ create mode 100644 crates/holochain/src/conductor/conductor/tests/request_gossip_round.rs
+
+diff --git a/crates/client/src/app_websocket.rs b/crates/client/src/app_websocket.rs
+index e9f69af..7abc199 100644
+--- a/crates/client/src/app_websocket.rs
++++ b/crates/client/src/app_websocket.rs
+@@ -463,6 +463,27 @@ impl AppWebsocket {
+         }
+     }
+ 
++    /// Ask the conductor to start its next gossip round in `dna_hash` with the
++    /// peer at `url`, which must be a live agent in its peer store (e.g. added
++    /// with [`AppWebsocket::add_agent_info`]).
++    pub async fn request_gossip_round(
++        &self,
++        dna_hash: DnaHash,
++        url: Url,
++    ) -> ConductorApiResult<()> {
++        let response = self
++            .inner
++            .send(AppRequest::RequestGossipRound {
++                dna_hash,
++                url: url.to_string(),
++            })
++            .await?;
++        match response {
++            AppResponse::Ok => Ok(()),
++            _ => unreachable!("Unexpected response {:?}", response),
++        }
++    }
++
+     /// Opt this connection in to `SystemSignal::OpsIntegrated` signals for the DNAs of this
+     /// app. They then arrive through [`AppWebsocket::on_signal`]. Best effort: reconcile with
+     /// [`AppWebsocket::dump_op_timings`].
+diff --git a/crates/holochain/src/conductor/api/api_external/app_interface.rs b/crates/holochain/src/conductor/api/api_external/app_interface.rs
+index 0dd89be..28960bb 100644
+--- a/crates/holochain/src/conductor/api/api_external/app_interface.rs
++++ b/crates/holochain/src/conductor/api/api_external/app_interface.rs
+@@ -95,6 +95,13 @@ impl AppInterfaceApi {
+                     .await?;
+                 Ok(AppResponse::AgentInfoAdded)
+             }
++            AppRequest::RequestGossipRound { dna_hash, url } => {
++                let url = kitsune2_api::Url::from_str(&url)?;
++                self.conductor_handle
++                    .request_gossip_round_for_app(&installed_app_id, dna_hash, url)
++                    .await?;
++                Ok(AppResponse::Ok)
++            }
+             AppRequest::PeerMetaInfo { url, dna_hashes } => {
+                 let url = kitsune2_api::Url::from_str(&url)?;
+                 let r = self
+diff --git a/crates/holochain/src/conductor/conductor.rs b/crates/holochain/src/conductor/conductor.rs
+index 81b2f3a..6179ad5 100755
+--- a/crates/holochain/src/conductor/conductor.rs
++++ b/crates/holochain/src/conductor/conductor.rs
+@@ -2801,7 +2801,8 @@ mod state_impls {
+                                 Some(c) => c.enabled_apps_with_dna(&dna).await,
+                                 None => Vec::new(),
+                             }
+-                        }) as futures::future::BoxFuture<'static, Vec<InstalledAppId>>
++                        })
++                            as futures::future::BoxFuture<'static, Vec<InstalledAppId>>
+                     })
+                 },
+             );
+@@ -3437,6 +3438,25 @@ mod misc_impls {
+             Ok(self.holochain_p2p.dump_network_metrics(request).await?)
+         }
+ 
++        /// Start the next gossip round in one of an app's DNAs with a known peer.
++        /// See [`AppRequest::RequestGossipRound`](holochain_conductor_api::AppRequest::RequestGossipRound).
++        pub async fn request_gossip_round_for_app(
++            &self,
++            installed_app_id: &InstalledAppId,
++            dna_hash: DnaHash,
++            url: kitsune2_api::Url,
++        ) -> ConductorApiResult<()> {
++            let state = self.get_state().await?;
++            let app = state.get_app(installed_app_id)?;
++            if !app.all_cells().any(|c| *c.dna_hash() == dna_hash) {
++                return Err(ConductorApiError::Other("DNA hash not found in app".into()));
++            }
++            self.holochain_p2p
++                .request_gossip_round(dna_hash, url)
++                .await?;
++            Ok(())
++        }
++
+         /// Dump of network metrics from Kitsune2.
+         ///
+         /// This version of the function filters the metrics to only include connections
+diff --git a/crates/holochain/src/conductor/conductor/tests.rs b/crates/holochain/src/conductor/conductor/tests.rs
+index 3299c27..91bc1ff 100644
+--- a/crates/holochain/src/conductor/conductor/tests.rs
++++ b/crates/holochain/src/conductor/conductor/tests.rs
+@@ -27,6 +27,7 @@ mod builder;
+ mod cells_with_conflicting_overrides;
+ mod direct_signal_capability;
+ mod p2p_config_override;
++mod request_gossip_round;
+ mod state_dump;
+ mod zome_call_capability;
+ 
+diff --git a/crates/holochain/src/conductor/conductor/tests/request_gossip_round.rs b/crates/holochain/src/conductor/conductor/tests/request_gossip_round.rs
+new file mode 100644
+index 0000000..770efec
+--- /dev/null
++++ b/crates/holochain/src/conductor/conductor/tests/request_gossip_round.rs
+@@ -0,0 +1,108 @@
++use crate::sweettest::*;
++use crate::test_utils::inline_zomes::simple_crud_zome;
++use holo_hash::{ActionHash, DhtOpHash, DnaHash};
++use holochain_types::prelude::InstalledAppId;
++use kitsune2_api::Url;
++use std::collections::HashSet;
++use std::time::Duration;
++
++/// Hashes of the ops `conductor` has integrated for `dna`.
++async fn integrated_ops(conductor: &SweetConductor, dna: &DnaHash) -> HashSet<DhtOpHash> {
++    conductor
++        .dump_op_timings(dna, None, Some(10_000))
++        .await
++        .unwrap()
++        .timings
++        .into_iter()
++        .filter(|t| t.when_integrated.is_some())
++        .map(|t| t.op_hash)
++        .collect()
++}
++
++/// A requested gossip round moves data between two peers long before the
++/// scheduled one would. Publishing is off and the scheduled initiate
++/// interval is a minute, so without the request nothing is exchanged during
++/// the test.
++#[tokio::test(flavor = "multi_thread")]
++async fn requested_gossip_round_syncs_before_the_schedule() {
++    holochain_trace::test_run();
++
++    let config = SweetConductorConfig::rendezvous(false).tune_network_config(|nc| {
++        *nc = std::mem::take(nc)
++            .with_gossip_initiate_interval_ms(60_000)
++            .with_gossip_min_initiate_interval_ms(60_000);
++        nc.disable_publish = true;
++    });
++    let mut conductors = SweetConductorBatch::from_config_rendezvous(2, config).await;
++    let (dna, _, _) = SweetDnaFile::unique_from_inline_zomes(simple_crud_zome()).await;
++    let dna_hash = dna.dna_hash().clone();
++    let app_id: InstalledAppId = "app".into();
++    let apps = conductors
++        .setup_app(&app_id, std::slice::from_ref(&dna))
++        .await
++        .unwrap();
++    let ((alice,), (bob,)) = apps.into_tuples();
++    for c in conductors.iter() {
++        c.declare_full_storage_arcs(&dna_hash).await;
++    }
++    conductors.exchange_peer_info().await;
++
++    let _: ActionHash = conductors[0]
++        .call(
++            &alice.zome(SweetInlineZomes::COORDINATOR),
++            "create_string",
++            "hi".to_string(),
++        )
++        .await;
++    let alice_ops = integrated_ops(&conductors[0], &dna_hash).await;
++
++    // Control: nothing reaches Bob on its own within a few seconds.
++    tokio::time::sleep(Duration::from_secs(3)).await;
++    assert!(!alice_ops.is_subset(&integrated_ops(&conductors[1], &dna_hash).await));
++
++    // Requests are refused for a DNA outside the app, for a peer that is not
++    // a live entry in Bob's peer store, and for Bob's own agent.
++    let other_dna = DnaHash::from_raw_32(vec![1; 32]);
++    let unknown = Url::from_str("ws://unknown.test:80/peer").unwrap();
++    // Each conductor's peer store holds both agents; pick by agent key.
++    let url_of = |agent: kitsune2_api::AgentId| {
++        let infos = conductors[1].get_agent_infos(Some(vec![dna_hash.clone()]));
++        async move {
++            infos
++                .await
++                .unwrap()
++                .into_iter()
++                .find(|info| info.agent == agent)
++                .and_then(|info| info.url.clone())
++                .expect("agent has a url")
++        }
++    };
++    let alice_url = url_of(alice.agent_pubkey().to_k2_agent()).await;
++    let bob_url = url_of(bob.agent_pubkey().to_k2_agent()).await;
++    assert!(conductors[1]
++        .request_gossip_round_for_app(&app_id, other_dna, alice_url.clone())
++        .await
++        .is_err());
++    assert!(conductors[1]
++        .request_gossip_round_for_app(&app_id, dna_hash.clone(), unknown)
++        .await
++        .is_err());
++    assert!(conductors[1]
++        .request_gossip_round_for_app(&app_id, dna_hash.clone(), bob_url)
++        .await
++        .is_err());
++
++    let requested = std::time::Instant::now();
++    conductors[1]
++        .request_gossip_round_for_app(&app_id, dna_hash.clone(), alice_url)
++        .await
++        .unwrap();
++    tokio::time::timeout(Duration::from_secs(15), async {
++        while !alice_ops.is_subset(&integrated_ops(&conductors[1], &dna_hash).await) {
++            tokio::time::sleep(Duration::from_millis(100)).await;
++        }
++    })
++    .await
++    .expect("Bob integrated Alice's ops after the requested round");
++    println!("synced {:?} after the request", requested.elapsed());
++}
+diff --git a/crates/holochain_conductor_api/src/app_interface.rs b/crates/holochain_conductor_api/src/app_interface.rs
+index 69e3d92..5582274 100644
+--- a/crates/holochain_conductor_api/src/app_interface.rs
++++ b/crates/holochain_conductor_api/src/app_interface.rs
+@@ -71,6 +71,29 @@ pub enum AppRequest {
+         dna_hashes: Option<Vec<DnaHash>>,
+     },
+ 
++    /// Ask this conductor to start its next gossip round for `dna_hash` with
++    /// the peer at `url`, instead of waiting for its gossip schedule to pick
++    /// a peer.
++    ///
++    /// `url` must belong to a live agent in this conductor's peer store, for
++    /// example one added with [`AppRequest::AddAgentInfo`]; agent infos are
++    /// signature-verified when added, so an unverified peer cannot be
++    /// requested. The peer still applies its own rate limits, and ordinary
++    /// peer selection resumes afterwards. Useful for a node that was offline
++    /// and knows which always-on peer holds the data it is missing.
++    ///
++    /// `dna_hash` must be the DNA of a cell of this app.
++    ///
++    /// # Returns
++    ///
++    /// [`AppResponse::Ok`]
++    RequestGossipRound {
++        /// The DNA (DHT space) to gossip in.
++        dna_hash: DnaHash,
++        /// The peer's Kitsune2 URL, as found in its agent info, as a string.
++        url: String,
++    },
++
+     /// Call a zome function.
+     ///
+     /// The payload to this call is composed of the serialized [`ZomeCallParams`] as bytes
+diff --git a/crates/holochain_p2p/src/spawn/actor.rs b/crates/holochain_p2p/src/spawn/actor.rs
+index 63b0dd9..5a6cbe1 100644
+--- a/crates/holochain_p2p/src/spawn/actor.rs
++++ b/crates/holochain_p2p/src/spawn/actor.rs
+@@ -2791,6 +2791,23 @@ impl actor::HcP2p for HolochainP2pActor {
+         Box::pin(async move { Ok(self.kitsune.transport().await?.dump_network_stats().await?) })
+     }
+ 
++    fn request_gossip_round(
++        &self,
++        dna_hash: DnaHash,
++        url: kitsune2_api::Url,
++    ) -> BoxFut<'_, HolochainP2pResult<()>> {
++        Box::pin(async move {
++            let space_id = dna_hash.to_k2_space();
++            let space = self
++                .kitsune
++                .space_if_exists(space_id.clone())
++                .await
++                .ok_or(HolochainP2pError::K2SpaceNotFound(space_id))?;
++            space.gossip().request_round(url).await?;
++            Ok(())
++        })
++    }
++
+     fn target_arcs(
+         &self,
+         dna_hash: DnaHash,
+diff --git a/crates/holochain_p2p/src/types/actor.rs b/crates/holochain_p2p/src/types/actor.rs
+index eb6cbd8..745180f 100644
+--- a/crates/holochain_p2p/src/types/actor.rs
++++ b/crates/holochain_p2p/src/types/actor.rs
+@@ -407,6 +407,14 @@ pub trait HcP2p: 'static + Send + Sync + std::fmt::Debug + Any {
+     fn dump_network_stats(&self)
+         -> BoxFut<'_, HolochainP2pResult<kitsune2_api::ApiTransportStats>>;
+ 
++    /// Ask Kitsune2 to start the next gossip round in `dna_hash`'s space with
++    /// the peer at `url`. The peer must be a live agent in the peer store.
++    fn request_gossip_round(
++        &self,
++        dna_hash: DnaHash,
++        url: kitsune2_api::Url,
++    ) -> BoxFut<'_, HolochainP2pResult<()>>;
++
+     /// Get the target arcs of the agents currently in this space.
+     fn target_arcs(
+         &self,
