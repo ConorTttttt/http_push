@@ -1,0 +1,9 @@
+target
+.demo
+data
+fixtures
+docs
+scripts
+deploy
+.git
+**/*.sqlite3*

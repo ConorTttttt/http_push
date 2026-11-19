@@ -147,7 +147,7 @@ pub async fn events(
                                 continue;
                             }
                             last_seq = env.seq();
-                            if spaces.iter().any(|s| *s == env.space) {
+                            if spaces.contains(&env.space) {
                                 yield Ok(change_event(env));
                             }
                         }

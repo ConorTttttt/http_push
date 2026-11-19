@@ -1,0 +1,121 @@
+# Holochain HTTP push relay deployments.
+#
+#   cp deploy/.env.example deploy/.env
+#   docker compose -f deploy/compose.yaml --profile mock up --build      # two mock relays, no Holochain
+#   docker compose -f deploy/compose.yaml --profile edgenode up --build  # EdgeNode + relay + TLS
+#
+# Security model (edgenode profile):
+# * The relay shares the EdgeNode container's network namespace
+#   (network_mode: service:edgenode), so it reaches the conductor's admin
+#   websocket on 127.0.0.1:4444. Neither the admin nor the app websocket is
+#   published or reachable from any other container.
+# * Only Caddy publishes ports. It terminates TLS and forwards /v1/* to the
+#   relay over the internal compose network.
+
+name: hc-push
+
+x-relay-common: &relay-common
+  image: ${RELAY_IMAGE:-hc-push-relay:local}
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  stop_grace_period: 20s
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  # ------------------------------------------------------------ profile: mock
+  relay-a:
+    <<: *relay-common
+    profiles: ["mock"]
+    environment:
+      HC_PUSH_SOURCE: mock
+      HC_PUSH_SPACES: ${MOCK_SPACE:-uhC0kDemoSpaceDemoSpaceDemoSpaceDemoSpaceDemoSpaceDem}
+      HC_PUSH_RELAY_ID: relay-a
+      HC_PUSH_REGISTRATION: ${HC_PUSH_REGISTRATION:-key}
+      HC_PUSH_REGISTRATION_KEYS: ${HC_PUSH_REGISTRATION_KEYS:?set HC_PUSH_REGISTRATION_KEYS in deploy/.env}
+      # DEV ONLY: the operator listener (mock injection) must bind the
+      # container interface to be published, so it is published to the
+      # HOST's loopback only:
+      #   curl -XPOST 127.0.0.1:9787/admin/v1/mock/changes -d '{"space":"...","ids":["x"]}'
+      HC_PUSH_ADMIN_BIND: 0.0.0.0:9787
+      HC_PUSH_DANGER_ADMIN_NON_LOOPBACK: "true"
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes: ["relay-a-data:/data"]
+    ports: ["127.0.0.1:8787:8787", "127.0.0.1:9787:9787"]
+
+  relay-b:
+    <<: *relay-common
+    profiles: ["mock"]
+    environment:
+      HC_PUSH_SOURCE: mock
+      HC_PUSH_SPACES: ${MOCK_SPACE:-uhC0kDemoSpaceDemoSpaceDemoSpaceDemoSpaceDemoSpaceDem}
+      HC_PUSH_RELAY_ID: relay-b
+      HC_PUSH_REGISTRATION: ${HC_PUSH_REGISTRATION:-key}
+      HC_PUSH_REGISTRATION_KEYS: ${HC_PUSH_REGISTRATION_KEYS:?set HC_PUSH_REGISTRATION_KEYS in deploy/.env}
+      HC_PUSH_ADMIN_BIND: 0.0.0.0:9787
+      HC_PUSH_DANGER_ADMIN_NON_LOOPBACK: "true"
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes: ["relay-b-data:/data"]
+    ports: ["127.0.0.1:8788:8787", "127.0.0.1:9788:9787"]
+
+  # -------------------------------------------------------- profile: edgenode
+  edgenode:
+    profiles: ["edgenode"]
+    image: ${EDGENODE_IMAGE:-ghcr.io/holo-host/edgenode:latest}
+    restart: unless-stopped
+    volumes: ["holo-data:/data"]
+    # No published ports: admin (4444) and app websockets stay internal.
+    healthcheck:
+      test: ["CMD", "pgrep", "holochain"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  relay:
+    <<: *relay-common
+    profiles: ["edgenode"]
+    network_mode: "service:edgenode"
+    depends_on:
+      edgenode: { condition: service_healthy }
+    environment:
+      HC_PUSH_SOURCE: holochain
+      HC_PUSH_HC_ADMIN_ADDR: 127.0.0.1:4444
+      HC_PUSH_HC_APP_ID: ${HC_PUSH_HC_APP_ID:?set HC_PUSH_HC_APP_ID in deploy/.env}
+      HC_PUSH_RELAY_ID: ${HC_PUSH_RELAY_ID:-}
+      HC_PUSH_REGISTRATION: ${HC_PUSH_REGISTRATION:-key}
+      HC_PUSH_REGISTRATION_KEYS: ${HC_PUSH_REGISTRATION_KEYS:-}
+      HC_PUSH_RETENTION_MAX_EVENTS: ${HC_PUSH_RETENTION_MAX_EVENTS:-100000}
+      HC_PUSH_RETENTION_MAX_AGE_SECS: ${HC_PUSH_RETENTION_MAX_AGE_SECS:-604800}
+      HC_PUSH_RATE_LIMIT_PER_MINUTE: ${HC_PUSH_RATE_LIMIT_PER_MINUTE:-120}
+      HC_PUSH_TRUST_FORWARDED_FOR: "true"
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes: ["relay-data:/data"]
+
+  tls:
+    profiles: ["edgenode"]
+    image: caddy:2.8
+    restart: unless-stopped
+    depends_on: [relay]
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:-localhost}
+      # The relay lives in the edgenode network namespace.
+      RELAY_UPSTREAM: edgenode:8787
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+
+volumes:
+  relay-a-data:
+  relay-b-data:
+  relay-data:
+  holo-data:
+  caddy-data:

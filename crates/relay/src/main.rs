@@ -41,8 +41,44 @@ async fn shutdown_signal(token: CancellationToken) {
     token.cancel();
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// `hc-push-relay healthcheck`: container health probe without curl or a
+/// shell (distroless image). Exits 0 if `GET /v1/health` answers 200.
+fn healthcheck() -> std::process::ExitCode {
+    use std::io::{Read, Write};
+    let bind = std::env::var("HC_PUSH_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let port = bind.rsplit(':').next().unwrap_or("8787");
+    let addr = format!("127.0.0.1:{port}");
+    let probe = || -> std::io::Result<bool> {
+        let timeout = Some(Duration::from_secs(3));
+        let addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|_| std::io::Error::other("bad HC_PUSH_BIND"))?;
+        let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
+        s.set_read_timeout(timeout)?;
+        s.set_write_timeout(timeout)?;
+        s.write_all(b"GET /v1/health HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+        let mut buf = [0u8; 16];
+        let n = s.read(&mut buf)?;
+        Ok(buf[..n].starts_with(b"HTTP/1.0 200") || buf[..n].starts_with(b"HTTP/1.1 200"))
+    };
+    match probe() {
+        Ok(true) => std::process::ExitCode::SUCCESS,
+        _ => std::process::ExitCode::FAILURE,
+    }
+}
+
+fn main() -> anyhow::Result<std::process::ExitCode> {
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        return Ok(healthcheck());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.log_format);
     cli.validate()?;

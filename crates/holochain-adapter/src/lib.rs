@@ -44,6 +44,8 @@ pub const APP_SIGNAL_SOURCE_ID: &str = "holochain-app-signals";
 /// newer ops; it is then only reported if it was integrated before the
 /// next scan passes it.
 const MAX_PENDING_WINDOW: usize = 20_000;
+/// Upper bound on `DumpOpTimings` pages read per DNA per poll.
+const MAX_PAGES_PER_POLL: usize = 10;
 
 #[derive(Debug, Clone)]
 pub struct HolochainConfig {
@@ -255,7 +257,17 @@ pub struct ScanStep {
 /// op still pending, so it is re-examined until it concludes. Re-reporting
 /// concluded ops after it is harmless: the journal de-duplicates by
 /// `change_key`.
-pub fn classify(space: &str, start: Option<ScanCursor>, timings: &[OpTimingDump]) -> ScanStep {
+///
+/// `reached_end` is false when the scan stopped at its per-poll page budget.
+/// Holding the low-water mark then would restart every poll at the same
+/// pending op and never reach newer ops, so the cursor advances past the
+/// scanned region instead (pending ops in it are then not re-checked).
+pub fn classify(
+    space: &str,
+    start: Option<ScanCursor>,
+    timings: &[OpTimingDump],
+    reached_end: bool,
+) -> ScanStep {
     let mut step = ScanStep::default();
     let mut prev = start;
     let mut low_water: Option<Option<ScanCursor>> = None;
@@ -285,11 +297,12 @@ pub fn classify(space: &str, start: Option<ScanCursor>, timings: &[OpTimingDump]
         prev = Some(ScanCursor::of(t));
     }
     step.next = match low_water {
-        Some(lw) if since_low_water <= MAX_PENDING_WINDOW => lw,
+        Some(lw) if reached_end && since_low_water <= MAX_PENDING_WINDOW => lw,
         Some(_) => {
             tracing::warn!(
                 space,
-                "pending-validation window too large; advancing past stuck ops"
+                pending = step.pending,
+                "backlog behind ops pending validation exceeds the scan budget; advancing past them"
             );
             prev
         }
@@ -314,7 +327,8 @@ impl OpTimingsSource {
         let mut all = Vec::new();
         let mut cursor = start.as_ref().map(|c| c.to_hc()).transpose()?;
         // Bound the work per poll.
-        for _ in 0..10 {
+        let mut reached_end = false;
+        for _ in 0..MAX_PAGES_PER_POLL {
             let page = app
                 .dump_op_timings(dna.clone(), cursor.clone(), Some(self.cfg.page_limit))
                 .await
@@ -323,10 +337,13 @@ impl OpTimingsSource {
             all.extend(page.timings);
             match page.cursor {
                 Some(c) if n as u32 >= self.cfg.page_limit => cursor = Some(c),
-                _ => break,
+                _ => {
+                    reached_end = true;
+                    break;
+                }
             }
         }
-        Ok(classify(&space, start, &all))
+        Ok(classify(&space, start, &all, reached_end))
     }
 }
 
@@ -556,7 +573,7 @@ mod tests {
             t(1, 100, true, Some(RecordValidity::Accepted)),
             t(2, 200, true, Some(RecordValidity::Rejected)),
         ];
-        let step = classify("dna", None, &pages);
+        let step = classify("dna", None, &pages, true);
         assert_eq!(step.changes.len(), 2);
         assert_eq!(step.changes[0].kind, ChangeKind::OpIntegrated);
         assert_eq!(step.changes[1].kind, ChangeKind::OpRejected);
@@ -577,7 +594,7 @@ mod tests {
             t(2, 200, false, None), // still validating
             t(3, 300, true, Some(RecordValidity::Accepted)),
         ];
-        let step = classify("dna", start, &pages);
+        let step = classify("dna", start, &pages, true);
         assert_eq!(
             step.changes.len(),
             2,
@@ -592,15 +609,28 @@ mod tests {
             when_received: 50,
             op_hash: op(9).to_string(),
         });
-        let step = classify("dna", start.clone(), &[t(2, 200, false, None)]);
+        let step = classify("dna", start.clone(), &[t(2, 200, false, None)], true);
         assert_eq!(step.next, start);
+    }
+
+    #[test]
+    fn budget_exhausted_scan_advances_past_pending_ops() {
+        // A stuck pending op followed by more ops than one poll can read
+        // must not pin every future scan to the same position.
+        let pages = [
+            t(1, 100, false, None),
+            t(2, 200, true, Some(RecordValidity::Accepted)),
+        ];
+        let step = classify("dna", None, &pages, false);
+        assert_eq!(step.changes.len(), 1);
+        assert_eq!(step.next, Some(ScanCursor::of(&pages[1])));
     }
 
     #[test]
     fn abandoned_ops_are_skipped_without_blocking() {
         let mut a = t(1, 100, false, None);
         a.abandoned_at = Some(Timestamp::from_micros(150));
-        let step = classify("dna", None, &[a.clone()]);
+        let step = classify("dna", None, &[a.clone()], true);
         assert!(step.changes.is_empty());
         assert_eq!(step.next, Some(ScanCursor::of(&a)));
     }
@@ -611,7 +641,7 @@ mod tests {
             when_received: 1,
             op_hash: op(1).to_string(),
         });
-        let step = classify("dna", start.clone(), &[]);
+        let step = classify("dna", start.clone(), &[], true);
         assert_eq!(step.next, start);
     }
 

@@ -1,0 +1,23 @@
+# TLS termination for the relay. Caddy obtains a certificate automatically
+# for RELAY_DOMAIN (public DNS name), or uses its internal CA for localhost.
+{$RELAY_DOMAIN:localhost} {
+	encode gzip
+	# Only the public v1 API is exposed.
+	@api path /v1/*
+	handle @api {
+		reverse_proxy {$RELAY_UPSTREAM:relay:8787} {
+			# Stream Server-Sent Events without buffering.
+			flush_interval -1
+			# The relay sees the client address in X-Forwarded-For
+			# (set HC_PUSH_TRUST_FORWARDED_FOR=true on the relay).
+		}
+	}
+	handle {
+		respond "not found" 404
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+}
