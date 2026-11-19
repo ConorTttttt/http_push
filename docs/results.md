@@ -3,7 +3,55 @@
 All numbers are from runs in this repository's development container
 (4 vCPU, Linux 6.18, no IPv6, loopback networking). Absolute values will
 differ on real HoloPorts and phones; the comparisons between runs are the
-point. Each row is one run of `scripts/holochain-three-node-e2e.sh`. The raw
+point. No phone was used: the "device" is a desktop conductor process that
+is stopped and started.
+
+## Milestone 3: mobile lifecycle with stale peers, two relays and storage arcs
+
+`scripts/mobile-lifecycle-e2e.sh`, repeated by `scripts/lifecycle-benchmarks.sh`.
+Raw `results.json` of every run (including the device helper's report and
+C's gossip attempts): [`results-data/lifecycle/`](results-data/lifecycle/).
+
+Setup of every run:
+
+* Local `kitsune2-bootstrap-srv` 0.5.3 (bootstrap + iroh relay),
+  `GOSSIP=fast`, bootstrap **enabled** for every conductor including C.
+* A: stock `holochain 0.7.1`. B and D: holochain 0.7.1 + `upstream/holochain-0.7.1`
+  (dev profile), each with its **own** relay (`OpsIntegrated` source, 30 s
+  reconciliation poll), own journal and own registration key. C: stock or
+  patched per variant.
+* 1. C syncs genesis and subscribes to both relays. 2. C stops. 3. A
+  authors 34 notes (102-106 new DHT ops). 4. B and D integrate them; **A
+  stops** (its record stays valid in the bootstrap service: a stale peer).
+  5. C's client syncs hints from both relays (`--policy all`, deduplicated)
+  and fetches both peer records. 6. C starts. 7-8. `hc-push-device` adds
+  the records (C verifies the signatures), optionally requests a round, and
+  waits until every required op is integrated, `Accepted` and
+  `locally_validated` in C's own `DumpOpTimings`. 9. C stops.
+* Times are from C's conductor process start. CPU is C's `utime+stime` from
+  `/proc` up to that point (includes conductor start-up). Kitsune2 bytes
+  are the sums over C's open connections (`DumpNetworkStats`) at that point.
+  HTTP bytes are C's client counters for the hint sync and both peer
+  requests.
+
+Variants:
+
+| Variant | C conductor | C config | Device helper |
+|---|---|---|---|
+| `baseline` | stock 0.7.1 | defaults (connect timeout 22 s) | adds peer records only |
+| `rto8` | stock 0.7.1 | `network.request_timeout_s: 8` (connect timeout 3 s) | adds peer records only |
+| `patched-noreq` | patched | defaults | adds peer records only (control: the patch alone changes nothing) |
+| `round` | patched | defaults | adds peer records, then `RequestGossipRound` for B and D |
+| `zero` | patched | `target_arc_factor: 0` | `--arc empty`, requests rounds; then reads 3 of A's notes with `get` |
+| `zero-rto8` | patched | zero arc + `request_timeout_s: 8` | as `zero` |
+| `round-relay-restart` | patched | defaults | as `round`; relay B is stopped while A authors the middle third of the notes and restarted before the last third |
+
+<!-- lifecycle-tables:start -->
+<!-- lifecycle-tables:end -->
+
+## Milestone 2: three conductors, polling vs event-driven
+
+Each row is one run of `scripts/holochain-three-node-e2e.sh`. The raw
 `results.json` of each run is in [`results-data/`](results-data/); logs are
 written to `.demo/three-node-*` (not committed).
 
@@ -37,7 +85,7 @@ Definitions:
 * **Bytes**: HTTP bytes as seen by the client (request line, headers, body;
   header sizes estimated; TLS/TCP not included).
 
-## Notification latency (relay on B)
+### Notification latency (relay on B)
 
 | Run | Detection (B integrated → relay journal), ms p50 / max | Notification (journal → online client, SSE), ms p50 / max | End-to-end (B integrated → online client), ms p50 / max | Hint sources |
 |---|---|---|---|---|
@@ -54,7 +102,7 @@ stock-crates relay (`holochain_client` 0.9.1, `on_signal` registered)
 journaled the normal app signal and all 52 ops by polling, and never received
 an `OpsIntegrated` signal (no decode panic in its log).
 
-## Catch-up of the offline conductor C
+### Catch-up of the offline conductor C
 
 | Run | Ops authored on A / new on B / hinted to C / validated by C | C hint sync over HTTP (ms, requests, bytes in) | Peer-hint request (bytes in) | C conductor ready, ms | First op received / all integrated, ms after start | Gossip attempts after restart |
 |---|---|---|---|---|---|---|
@@ -70,7 +118,7 @@ B. In every run that caught up, all hinted ops were held, integrated,
 `Accepted` and `locally_validated: true` in C's own `DumpOpTimings`. A was
 offline, so the data came from B.
 
-## HTTP bandwidth
+### HTTP bandwidth
 
 | Exchange | Requests | Bytes in (client) | Bytes out (client) |
 |---|---|---|---|
@@ -88,7 +136,7 @@ numbers for the measured exchanges.
 The data itself (the 18–22 ops) moved between conductors over Kitsune2
 (iroh), not over HTTP, and is not included above.
 
-## Reading the numbers
+### Reading the numbers
 
 * **Event-driven detection is roughly 30–50× faster than 1 s polling.** p50 4–7 ms
   versus ~200–240 ms from B's integration to the relay journal; end-to-end
@@ -124,34 +172,3 @@ The data itself (the 18–22 ops) moved between conductors over Kitsune2
   and 18–20 on B. A's count is lower, most likely because some of B's note
   ops had not yet reached A when A's dump was taken. C received and validated all 18–22 hinted ops.
 
-## Regression and unit tests
-
-`cargo test --workspace`: 63 tests pass, including
-`crates/relay/tests/holochain_reconcile.rs`. That test drives the real
-`DumpOpTimings` poller against a scripted conductor and an event path that
-loses notices while the relay is down. It checks four things:
-
-1. Ops integrated while the relay is up arrive through the event path, with
-   `occurred_at_ms`.
-2. Ops integrated while the relay is stopped (their notices lost) arrive
-   after restart from the persisted poller checkpoint. Earlier ops are not
-   re-delivered.
-3. An op still pending validation during a scan is reported once it
-   integrates, although its notice was dropped.
-4. A conductor outage is bridged by reconnecting.
-
-Every op is delivered exactly once with gap-free sequence numbers.
-
-Upstream (`holochain-0.7.1` + `upstream/holochain-0.7.1-ops-integrated.patch`),
-run in the patched Holochain tree:
-
-```
-cargo test -p holochain_state --lib -- dht_store::tests::integrate_ready_ops
-  4 passed  (incl. integrate_ready_ops_notifies_observer_through_clones)
-cargo test -p holochain --lib -- conductor::conductor::app_broadcast core::workflow::integrate_dht_ops_workflow
-  9 passed  (incl. ops_integrated_subscriptions_are_counted_until_dropped;
-             the existing integration-workflow tests are unchanged and pass)
-```
-
-The patch applies cleanly to a pristine `holochain-0.7.1` checkout
-(`git apply --check`). The full Holochain test suite was **not** run.

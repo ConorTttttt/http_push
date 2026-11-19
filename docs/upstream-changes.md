@@ -305,6 +305,12 @@ Proposals (not implemented):
 4. Publish an agent tombstone on graceful shutdown, so peers that stop
    cleanly do not linger as stale records. SIGTERM did not appear to do
    this in 0.7.1.
+5. Start the first initiation after a restart when the iroh home relay is
+   registered, instead of failing with "Connection attempted before home
+   relay URL is known" and retrying on a timer. In every lifecycle run with
+   a requested round, the first two attempts failed this way, and the
+   first round started about 3 s after the conductor was ready. That is now
+   the floor of catch-up time on this host.
 
 ---
 
